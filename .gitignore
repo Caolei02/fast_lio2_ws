@@ -1,2 +1,4 @@
 build/
 devel/
+src/FAST_LIO/PCD/scans.pcd
+*.pcd

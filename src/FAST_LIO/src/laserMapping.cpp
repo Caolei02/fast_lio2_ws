@@ -31,7 +31,7 @@
 // INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
 // CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
 // ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
-// POSSIBILITY OF SUCH DAMAGE.    //
+// POSSIBILITY OF SUCH DAMAGE.
 #include <omp.h>
 #include <mutex>
 #include <math.h>
@@ -43,6 +43,9 @@
 #include <so3_math.h>
 #include <ros/ros.h>
 #include <Eigen/Core>
+#include <Eigen/Eigenvalues>
+#include <algorithm>
+#include <array>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
@@ -139,6 +142,44 @@ geometry_msgs::PoseStamped msg_body_pose;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
+
+struct RectPipeGeomState
+{
+    bool valid = false;
+    V3D axis_w = V3D(1.0, 0.0, 0.0);
+    V3D u_w = V3D(0.0, 1.0, 0.0);
+    V3D v_w = V3D(0.0, 0.0, 1.0);
+    V3D axis_point_w = Zero3d;
+    double u_min = 0.0;
+    double u_max = 0.0;
+    double v_min = 0.0;
+    double v_max = 0.0;
+    double width = 0.0;
+    double height = 0.0;
+    double normal_planarity = 0.0;
+    double straight_confidence = 0.0;
+};
+
+RectPipeGeomState g_pipe_geom;
+bool   pipe_prior_enable = true;
+bool   pipe_debug_log = false;
+bool   pipe_degenerate = false;
+double pipe_prior_weight = 8.0;
+double pipe_axis_align_weight = 3.0;
+double pipe_motion_weight = 1.5;
+double pipe_min_width = 0.25;
+double pipe_max_width = 1.00;
+double pipe_min_height = 0.25;
+double pipe_max_height = 1.00;
+double pipe_axis_conf_threshold = 0.35;
+double pipe_degenerate_min_eig = 1e-4;
+double pipe_degenerate_ratio = 1e-3;
+double pipe_last_min_eig = 0.0;
+double pipe_last_cond_num = 0.0;
+double pipe_last_axial_info = 0.0;
+double pipe_last_lateral_info = 0.0;
+V3D    prev_lidar_pos_world = Zero3d;
+bool   prev_lidar_pos_valid = false;
 
 void SigHandle(int sig)
 {
@@ -590,10 +631,10 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
 {
     odomAftMapped.header.frame_id = "camera_init";
     odomAftMapped.child_frame_id = "body";
-    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);// ros::Time().fromSec(lidar_end_time);
+    odomAftMapped.header.stamp = ros::Time().fromSec(lidar_end_time);
     set_posestamp(odomAftMapped.pose);
-    pubOdomAftMapped.publish(odomAftMapped);
     auto P = kf.get_P();
+    for (int i = 0; i < 36; ++i) odomAftMapped.pose.covariance[i] = 0.0;
     for (int i = 0; i < 6; i ++)
     {
         int k = i < 3 ? i + 3 : i - 3;
@@ -604,6 +645,10 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
         odomAftMapped.pose.covariance[i*6 + 4] = P(k, 1);
         odomAftMapped.pose.covariance[i*6 + 5] = P(k, 2);
     }
+    odomAftMapped.twist.twist.linear.x = state_point.vel(0);
+    odomAftMapped.twist.twist.linear.y = state_point.vel(1);
+    odomAftMapped.twist.twist.linear.z = state_point.vel(2);
+    pubOdomAftMapped.publish(odomAftMapped);
 
     static tf::TransformBroadcaster br;
     tf::Transform                   transform;
@@ -617,6 +662,263 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     q.setZ(odomAftMapped.pose.pose.orientation.z);
     transform.setRotation( q );
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
+}
+
+
+inline V3D pointBodyToWorldVec(const V3D &pi, const state_ikfom &s)
+{
+    return s.rot * (s.offset_R_L_I * pi + s.offset_T_L_I) + s.pos;
+}
+
+inline M3D skewMatrix(const V3D &v)
+{
+    M3D m;
+    m << SKEW_SYM_MATRX(v);
+    return m;
+}
+
+double quantile_from_sorted(vector<double> vec, double q)
+{
+    if (vec.empty()) return 0.0;
+    std::sort(vec.begin(), vec.end());
+    double idx = q * double(vec.size() - 1);
+    int idx0 = int(std::floor(idx));
+    int idx1 = std::min(idx0 + 1, int(vec.size() - 1));
+    double t = idx - idx0;
+    return vec[idx0] * (1.0 - t) + vec[idx1] * t;
+}
+
+bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
+{
+    geom.valid = false;
+    if (effct_feat_num < 20) return false;
+
+    vector<V3D> normals;
+    vector<V3D> world_pts;
+    normals.reserve(effct_feat_num);
+    world_pts.reserve(effct_feat_num);
+
+    V3D centroid = Zero3d;
+    for (int i = 0; i < effct_feat_num; ++i)
+    {
+        const PointType &laser_p = laserCloudOri->points[i];
+        V3D p_body(laser_p.x, laser_p.y, laser_p.z);
+        V3D p_world = pointBodyToWorldVec(p_body, s);
+        const PointType &norm_p = corr_normvect->points[i];
+        V3D n(norm_p.x, norm_p.y, norm_p.z);
+        if (n.norm() < 1e-6) continue;
+        n.normalize();
+        world_pts.push_back(p_world);
+        normals.push_back(n);
+        centroid += p_world;
+    }
+
+    if (world_pts.size() < 20) return false;
+    centroid /= double(world_pts.size());
+
+    M3D normal_cov = M3D::Zero();
+    for (const auto &n : normals)
+    {
+        normal_cov += n * n.transpose();
+    }
+    normal_cov /= double(normals.size());
+
+    Eigen::SelfAdjointEigenSolver<M3D> eig_solver(normal_cov);
+    if (eig_solver.info() != Eigen::Success) return false;
+
+    auto eigvals = eig_solver.eigenvalues();
+    M3D eigvecs = eig_solver.eigenvectors();
+    V3D axis_w = eigvecs.col(0).normalized();
+
+    // Keep axis direction consistent with LiDAR forward direction.
+    V3D lidar_forward_w = s.rot * (s.offset_R_L_I * V3D(1.0, 0.0, 0.0));
+    if (axis_w.dot(lidar_forward_w) < 0.0) axis_w = -axis_w;
+
+    double sum_eval = std::max(1e-9, eigvals(0) + eigvals(1) + eigvals(2));
+    double normal_planarity = 1.0 - eigvals(0) / sum_eval;
+
+    V3D u_w = Zero3d;
+    V3D u_acc = Zero3d;
+    double best_proj = -1.0;
+    for (const auto &n : normals)
+    {
+        V3D proj = n - axis_w * (axis_w.dot(n));
+        double nn = proj.norm();
+        if (nn < 1e-3) continue;
+        proj /= nn;
+        if (nn > best_proj)
+        {
+            best_proj = nn;
+            u_w = proj;
+        }
+        if (u_acc.norm() > 1e-9 && proj.dot(u_acc) < 0.0) proj = -proj;
+        u_acc += proj;
+    }
+    if (u_acc.norm() > 1e-6) u_w = u_acc.normalized();
+    if (u_w.norm() < 1e-6) return false;
+
+    V3D v_w = axis_w.cross(u_w);
+    if (v_w.norm() < 1e-6) return false;
+    v_w.normalize();
+    u_w = v_w.cross(axis_w).normalized();
+
+    V3D axis_point_w = centroid - axis_w * (axis_w.dot(centroid));
+    vector<double> u_coords, v_coords;
+    u_coords.reserve(world_pts.size());
+    v_coords.reserve(world_pts.size());
+    for (const auto &p : world_pts)
+    {
+        V3D d = p - axis_point_w;
+        u_coords.push_back(d.dot(u_w));
+        v_coords.push_back(d.dot(v_w));
+    }
+
+    double u_min = quantile_from_sorted(u_coords, 0.05);
+    double u_max = quantile_from_sorted(u_coords, 0.95);
+    double v_min = quantile_from_sorted(v_coords, 0.05);
+    double v_max = quantile_from_sorted(v_coords, 0.95);
+    double width = u_max - u_min;
+    double height = v_max - v_min;
+
+    bool size_ok = (width > pipe_min_width && width < pipe_max_width &&
+                    height > pipe_min_height && height < pipe_max_height);
+    double straight_conf = std::min(1.0, std::max(0.0, (normal_planarity - 0.5) / 0.5));
+
+    geom.valid = size_ok && (straight_conf > pipe_axis_conf_threshold);
+    geom.axis_w = axis_w;
+    geom.u_w = u_w;
+    geom.v_w = v_w;
+    geom.axis_point_w = axis_point_w;
+    geom.u_min = u_min;
+    geom.u_max = u_max;
+    geom.v_min = v_min;
+    geom.v_max = v_max;
+    geom.width = width;
+    geom.height = height;
+    geom.normal_planarity = normal_planarity;
+    geom.straight_confidence = straight_conf;
+    return geom.valid;
+}
+
+void analyze_degeneracy(const MatrixXd &Hx, const RectPipeGeomState &geom)
+{
+    pipe_last_min_eig = 0.0;
+    pipe_last_cond_num = 0.0;
+    pipe_last_axial_info = 0.0;
+    pipe_last_lateral_info = 0.0;
+    pipe_degenerate = false;
+
+    if (Hx.rows() < 6) return;
+
+    Matrix<double, 6, 6> info = Hx.leftCols(6).transpose() * Hx.leftCols(6);
+    Eigen::SelfAdjointEigenSolver<Matrix<double, 6, 6>> solver(info);
+    if (solver.info() != Eigen::Success) return;
+
+    auto vals = solver.eigenvalues();
+    pipe_last_min_eig = vals(0);
+    pipe_last_cond_num = vals(5) / std::max(1e-12, vals(0));
+
+    Matrix3d info_pos = info.block<3, 3>(0, 0);
+    if (geom.valid)
+    {
+        pipe_last_axial_info = geom.axis_w.transpose() * info_pos * geom.axis_w;
+        Matrix3d Pperp = Matrix3d::Identity() - geom.axis_w * geom.axis_w.transpose();
+        pipe_last_lateral_info = (Pperp * info_pos * Pperp).trace() / 2.0;
+    }
+    else
+    {
+        pipe_last_axial_info = info_pos.trace() / 3.0;
+        pipe_last_lateral_info = pipe_last_axial_info;
+    }
+
+    bool min_eig_bad = pipe_last_min_eig < pipe_degenerate_min_eig;
+    bool axial_ratio_bad = pipe_last_axial_info < std::max(1e-12, pipe_last_lateral_info) * pipe_degenerate_ratio;
+    pipe_degenerate = min_eig_bad || axial_ratio_bad;
+}
+
+void augment_with_pipe_priors(const state_ikfom &s,
+                              const RectPipeGeomState &geom,
+                              MatrixXd &Hx,
+                              VectorXd &h)
+{
+    if (!pipe_prior_enable || !pipe_degenerate || !geom.valid) return;
+
+    vector<RowVectorXd> rows;
+    vector<double> residuals;
+
+    V3D lidar_forward_w = s.rot * (s.offset_R_L_I * V3D(1.0, 0.0, 0.0));
+    V3D att_res = lidar_forward_w.cross(geom.axis_w);
+    M3D d_att_d_theta = skewMatrix(geom.axis_w) * skewMatrix(lidar_forward_w);
+
+    for (int j = 0; j < 3; ++j)
+    {
+        RowVectorXd row = RowVectorXd::Zero(12);
+        row.block<1, 3>(0, 3) = pipe_axis_align_weight * d_att_d_theta.row(j);
+        rows.push_back(row);
+        residuals.push_back(-pipe_axis_align_weight * att_res(j));
+    }
+
+    V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+    if (prev_lidar_pos_valid)
+    {
+        Matrix3d Pperp = Matrix3d::Identity() - geom.axis_w * geom.axis_w.transpose();
+        V3D motion_res = Pperp * (lidar_pos_w - prev_lidar_pos_world);
+        M3D dpos_dtheta = -skewMatrix(s.rot * s.offset_T_L_I);
+        Matrix3d J_theta = Pperp * dpos_dtheta;
+        Matrix3d J_pos = Pperp;
+
+        for (int j = 0; j < 3; ++j)
+        {
+            RowVectorXd row = RowVectorXd::Zero(12);
+            row.block<1, 3>(0, 0) = pipe_motion_weight * J_pos.row(j);
+            row.block<1, 3>(0, 3) = pipe_motion_weight * J_theta.row(j);
+            rows.push_back(row);
+            residuals.push_back(-pipe_motion_weight * motion_res(j));
+        }
+    }
+
+    // Soft rectangular box prior: keep LiDAR pose inside the fitted cross section.
+    V3D rel = lidar_pos_w - geom.axis_point_w;
+    double u = rel.dot(geom.u_w);
+    double v = rel.dot(geom.v_w);
+    double margin = 0.05;
+    std::array<double, 4> box_res = {
+        std::max(0.0, u - (geom.u_max + margin)),
+        std::max(0.0, (geom.u_min - margin) - u),
+        std::max(0.0, v - (geom.v_max + margin)),
+        std::max(0.0, (geom.v_min - margin) - v)
+    };
+    std::array<V3D, 4> box_grads = {
+        geom.u_w,
+        -geom.u_w,
+        geom.v_w,
+        -geom.v_w
+    };
+    for (int j = 0; j < 4; ++j)
+    {
+        if (box_res[j] <= 0.0) continue;
+        RowVectorXd row = RowVectorXd::Zero(12);
+        row.block<1, 3>(0, 0) = pipe_prior_weight * box_grads[j].transpose();
+        row.block<1, 3>(0, 3) = pipe_prior_weight * (box_grads[j].transpose() * (-skewMatrix(s.rot * s.offset_T_L_I)));
+        rows.push_back(row);
+        residuals.push_back(-pipe_prior_weight * box_res[j]);
+    }
+
+    if (rows.empty()) return;
+
+    int old_rows = Hx.rows();
+    int add_rows = rows.size();
+    MatrixXd Hx_aug(old_rows + add_rows, Hx.cols());
+    VectorXd h_aug(old_rows + add_rows);
+    Hx_aug.topRows(old_rows) = Hx;
+    h_aug.head(old_rows) = h;
+    for (int i = 0; i < add_rows; ++i)
+    {
+        Hx_aug.row(old_rows + i) = rows[i];
+        h_aug(old_rows + i) = residuals[i];
+    }
+    Hx.swap(Hx_aug);
+    h.swap(h_aug);
 }
 
 void publish_path(const ros::Publisher pubPath)
@@ -750,6 +1052,27 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity;
     }
+
+    // ---- Rectangular pipe degeneracy detection and geometry-guided prior augmentation ----
+    fit_rect_pipe_geometry(s, g_pipe_geom);
+    analyze_degeneracy(ekfom_data.h_x, g_pipe_geom);
+    augment_with_pipe_priors(s, g_pipe_geom, ekfom_data.h_x, ekfom_data.h);
+
+    if (pipe_debug_log)
+    {
+        ROS_INFO_THROTTLE(0.5,
+                          "pipe valid=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e size=(%.3f, %.3f) conf=%.3f",
+                          g_pipe_geom.valid,
+                          pipe_degenerate,
+                          pipe_last_min_eig,
+                          pipe_last_cond_num,
+                          pipe_last_axial_info,
+                          pipe_last_lateral_info,
+                          g_pipe_geom.width,
+                          g_pipe_geom.height,
+                          g_pipe_geom.straight_confidence);
+    }
+
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -791,6 +1114,18 @@ int main(int argc, char** argv)
     nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    nh.param<bool>("pipe_prior/enable", pipe_prior_enable, true);
+    nh.param<bool>("pipe_prior/debug_log", pipe_debug_log, false);
+    nh.param<double>("pipe_prior/weight_box", pipe_prior_weight, 8.0);
+    nh.param<double>("pipe_prior/weight_axis_align", pipe_axis_align_weight, 3.0);
+    nh.param<double>("pipe_prior/weight_motion", pipe_motion_weight, 1.5);
+    nh.param<double>("pipe_prior/min_width", pipe_min_width, 0.25);
+    nh.param<double>("pipe_prior/max_width", pipe_max_width, 1.00);
+    nh.param<double>("pipe_prior/min_height", pipe_min_height, 0.25);
+    nh.param<double>("pipe_prior/max_height", pipe_max_height, 1.00);
+    nh.param<double>("pipe_prior/axis_conf_threshold", pipe_axis_conf_threshold, 0.35);
+    nh.param<double>("pipe_prior/degenerate_min_eig", pipe_degenerate_min_eig, 1e-4);
+    nh.param<double>("pipe_prior/degenerate_ratio", pipe_degenerate_ratio, 1e-3);
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -970,6 +1305,8 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            prev_lidar_pos_world = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+            prev_lidar_pos_valid = true;
 
             /*** add the feature points to map kdtree ***/
             t3 = omp_get_wtime();
