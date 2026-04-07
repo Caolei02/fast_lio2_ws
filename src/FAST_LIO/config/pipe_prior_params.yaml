@@ -1,0 +1,13 @@
+pipe_prior:
+  enable: true
+  debug_log: true
+  weight_box: 8.0
+  weight_axis_align: 3.0
+  weight_motion: 1.5
+  min_width: 0.30
+  max_width: 0.80
+  min_height: 0.30
+  max_height: 0.80
+  axis_conf_threshold: 0.35
+  degenerate_min_eig: 1e-4
+  degenerate_ratio: 1e-3
