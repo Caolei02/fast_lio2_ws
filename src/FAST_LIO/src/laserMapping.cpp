@@ -46,6 +46,8 @@
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <array>
+#include <limits>
+#include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
@@ -150,12 +152,17 @@ struct RectPipeGeomState
     V3D u_w = V3D(0.0, 1.0, 0.0);
     V3D v_w = V3D(0.0, 0.0, 1.0);
     V3D axis_point_w = Zero3d;
+    V3D centroid_w = Zero3d;
+    double t_min = 0.0;
+    double t_max = 0.0;
     double u_min = 0.0;
     double u_max = 0.0;
     double v_min = 0.0;
     double v_max = 0.0;
+    double length = 0.0;
     double width = 0.0;
     double height = 0.0;
+    double global_length = 0.0;
     double normal_planarity = 0.0;
     double straight_confidence = 0.0;
 };
@@ -180,6 +187,11 @@ double pipe_last_axial_info = 0.0;
 double pipe_last_lateral_info = 0.0;
 V3D    prev_lidar_pos_world = Zero3d;
 bool   prev_lidar_pos_valid = false;
+bool   pipe_global_axis_initialized = false;
+double pipe_global_t_min = std::numeric_limits<double>::infinity();
+double pipe_global_t_max = -std::numeric_limits<double>::infinity();
+double pipe_global_length = 0.0;
+V3D    pipe_global_axis_w = V3D(1.0, 0.0, 0.0);
 
 void SigHandle(int sig)
 {
@@ -691,6 +703,10 @@ double quantile_from_sorted(vector<double> vec, double q)
 bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
 {
     geom.valid = false;
+    geom.length = 0.0;
+    geom.width = 0.0;
+    geom.height = 0.0;
+    geom.global_length = pipe_global_length;
     if (effct_feat_num < 20) return false;
 
     vector<V3D> normals;
@@ -730,9 +746,10 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     M3D eigvecs = eig_solver.eigenvectors();
     V3D axis_w = eigvecs.col(0).normalized();
 
-    // Keep axis direction consistent with LiDAR forward direction.
+    // Keep axis direction consistent with LiDAR forward direction and across frames.
     V3D lidar_forward_w = s.rot * (s.offset_R_L_I * V3D(1.0, 0.0, 0.0));
     if (axis_w.dot(lidar_forward_w) < 0.0) axis_w = -axis_w;
+    if (pipe_global_axis_initialized && axis_w.dot(pipe_global_axis_w) < 0.0) axis_w = -axis_w;
 
     double sum_eval = std::max(1e-9, eigvals(0) + eigvals(1) + eigvals(2));
     double normal_planarity = 1.0 - eigvals(0) / sum_eval;
@@ -763,20 +780,25 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     u_w = v_w.cross(axis_w).normalized();
 
     V3D axis_point_w = centroid - axis_w * (axis_w.dot(centroid));
-    vector<double> u_coords, v_coords;
+    vector<double> t_coords, u_coords, v_coords;
+    t_coords.reserve(world_pts.size());
     u_coords.reserve(world_pts.size());
     v_coords.reserve(world_pts.size());
     for (const auto &p : world_pts)
     {
         V3D d = p - axis_point_w;
+        t_coords.push_back(d.dot(axis_w));
         u_coords.push_back(d.dot(u_w));
         v_coords.push_back(d.dot(v_w));
     }
 
+    double t_min = quantile_from_sorted(t_coords, 0.05);
+    double t_max = quantile_from_sorted(t_coords, 0.95);
     double u_min = quantile_from_sorted(u_coords, 0.05);
     double u_max = quantile_from_sorted(u_coords, 0.95);
     double v_min = quantile_from_sorted(v_coords, 0.05);
     double v_max = quantile_from_sorted(v_coords, 0.95);
+    double length = t_max - t_min;
     double width = u_max - u_min;
     double height = v_max - v_min;
 
@@ -789,14 +811,41 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     geom.u_w = u_w;
     geom.v_w = v_w;
     geom.axis_point_w = axis_point_w;
+    geom.centroid_w = centroid;
+    geom.t_min = t_min;
+    geom.t_max = t_max;
     geom.u_min = u_min;
     geom.u_max = u_max;
     geom.v_min = v_min;
     geom.v_max = v_max;
+    geom.length = length;
     geom.width = width;
     geom.height = height;
     geom.normal_planarity = normal_planarity;
     geom.straight_confidence = straight_conf;
+
+    if (geom.valid)
+    {
+        if (!pipe_global_axis_initialized)
+        {
+            pipe_global_axis_w = axis_w;
+            pipe_global_axis_initialized = true;
+        }
+
+        for (const auto &p : world_pts)
+        {
+            double t_global = p.dot(pipe_global_axis_w);
+            pipe_global_t_min = std::min(pipe_global_t_min, t_global);
+            pipe_global_t_max = std::max(pipe_global_t_max, t_global);
+        }
+        pipe_global_length = pipe_global_t_max - pipe_global_t_min;
+        geom.global_length = pipe_global_length;
+    }
+    else
+    {
+        geom.global_length = pipe_global_length;
+    }
+
     return geom.valid;
 }
 
@@ -937,6 +986,67 @@ void publish_path(const ros::Publisher pubPath)
     }
 }
 
+void publish_pipe_size(const ros::Publisher &pubPipeSize)
+{
+    if (!g_pipe_geom.valid) return;
+
+    geometry_msgs::Vector3 msg;
+    msg.x = g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : g_pipe_geom.length;
+    msg.y = g_pipe_geom.width;
+    msg.z = g_pipe_geom.height;
+    pubPipeSize.publish(msg);
+}
+
+void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
+{
+    visualization_msgs::Marker marker;
+    marker.header.frame_id = "camera_init";
+    marker.header.stamp = ros::Time().fromSec(lidar_end_time);
+    marker.ns = "pipe_bbox";
+    marker.id = 0;
+
+    if (!g_pipe_geom.valid)
+    {
+        marker.action = visualization_msgs::Marker::DELETE;
+        pubPipeBBox.publish(marker);
+        return;
+    }
+
+    marker.type = visualization_msgs::Marker::CUBE;
+    marker.action = visualization_msgs::Marker::ADD;
+
+    V3D center = g_pipe_geom.axis_point_w
+               + g_pipe_geom.axis_w * (0.5 * (g_pipe_geom.t_min + g_pipe_geom.t_max))
+               + g_pipe_geom.u_w * (0.5 * (g_pipe_geom.u_min + g_pipe_geom.u_max))
+               + g_pipe_geom.v_w * (0.5 * (g_pipe_geom.v_min + g_pipe_geom.v_max));
+
+    M3D rot;
+    rot.col(0) = g_pipe_geom.axis_w;
+    rot.col(1) = g_pipe_geom.u_w;
+    rot.col(2) = g_pipe_geom.v_w;
+    Eigen::Quaterniond q(rot);
+    q.normalize();
+
+    marker.pose.position.x = center(0);
+    marker.pose.position.y = center(1);
+    marker.pose.position.z = center(2);
+    marker.pose.orientation.x = q.x();
+    marker.pose.orientation.y = q.y();
+    marker.pose.orientation.z = q.z();
+    marker.pose.orientation.w = q.w();
+
+    marker.scale.x = std::max(1e-3, g_pipe_geom.length);
+    marker.scale.y = std::max(1e-3, g_pipe_geom.width);
+    marker.scale.z = std::max(1e-3, g_pipe_geom.height);
+
+    marker.color.r = 0.1f;
+    marker.color.g = 0.9f;
+    marker.color.b = 0.2f;
+    marker.color.a = 0.25f;
+    marker.lifetime = ros::Duration(0.2);
+    pubPipeBBox.publish(marker);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -1061,15 +1171,17 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     if (pipe_debug_log)
     {
         ROS_INFO_THROTTLE(0.5,
-                          "pipe valid=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e size=(%.3f, %.3f) conf=%.3f",
+                          "pipe valid=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e local_size=(L=%.3f, W=%.3f, H=%.3f) global_L=%.3f conf=%.3f",
                           g_pipe_geom.valid,
                           pipe_degenerate,
                           pipe_last_min_eig,
                           pipe_last_cond_num,
                           pipe_last_axial_info,
                           pipe_last_lateral_info,
+                          g_pipe_geom.length,
                           g_pipe_geom.width,
                           g_pipe_geom.height,
+                          g_pipe_geom.global_length,
                           g_pipe_geom.straight_confidence);
     }
 
@@ -1193,6 +1305,10 @@ int main(int argc, char** argv)
             ("/Odometry", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
+    ros::Publisher pubPipeSize      = nh.advertise<geometry_msgs::Vector3>
+            ("/pipe_size", 1000);
+    ros::Publisher pubPipeBBox      = nh.advertise<visualization_msgs::Marker>
+            ("/pipe_bbox", 10);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -1315,6 +1431,8 @@ int main(int argc, char** argv)
             
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
+            publish_pipe_size(pubPipeSize);
+            publish_pipe_bbox(pubPipeBBox);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
             // publish_effect_world(pubLaserCloudEffect);
