@@ -9,5 +9,5 @@ pipe_prior:
   min_height: 0.15
   max_height: 0.80
   axis_conf_threshold: 0.35
-  degenerate_min_eig: 1e-4
-  degenerate_ratio: 1e-3
+  degenerate_min_eig: 0.05
+  degenerate_ratio: 0.15

@@ -187,11 +187,64 @@ double pipe_last_axial_info = 0.0;
 double pipe_last_lateral_info = 0.0;
 V3D    prev_lidar_pos_world = Zero3d;
 bool   prev_lidar_pos_valid = false;
+V3D    prev_pipe_u_w = V3D(0.0, 1.0, 0.0);
+V3D    prev_pipe_v_w = V3D(0.0, 0.0, 1.0);
+bool   prev_pipe_basis_valid = false;
 bool   pipe_global_axis_initialized = false;
 double pipe_global_t_min = std::numeric_limits<double>::infinity();
 double pipe_global_t_max = -std::numeric_limits<double>::infinity();
 double pipe_global_length = 0.0;
 V3D    pipe_global_axis_w = V3D(1.0, 0.0, 0.0);
+ofstream pipe_csv_log;
+
+void init_pipe_csv_log(const string &csv_path)
+{
+    if (pipe_csv_log.is_open()) return;
+
+    bool need_header = true;
+    {
+        ifstream check_file(csv_path.c_str(), ios::in);
+        if (check_file.good())
+        {
+            check_file.seekg(0, ios::end);
+            need_header = (check_file.tellg() == 0);
+        }
+    }
+
+    pipe_csv_log.open(csv_path.c_str(), ios::out | ios::app);
+    if (!pipe_csv_log.is_open())
+    {
+        ROS_WARN("failed to open pipe csv log: %s", csv_path.c_str());
+        return;
+    }
+
+    if (need_header)
+    {
+        pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,local_length,width,height,global_length,conf\n";
+        pipe_csv_log.flush();
+    }
+}
+
+inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
+{
+    if (!pipe_csv_log.is_open()) return;
+
+    pipe_csv_log << fixed << setprecision(9)
+                 << stamp_abs << ","
+                 << stamp_rel << ","
+                 << int(g_pipe_geom.valid) << ","
+                 << int(pipe_degenerate) << ","
+                 << pipe_last_min_eig << ","
+                 << pipe_last_cond_num << ","
+                 << pipe_last_axial_info << ","
+                 << pipe_last_lateral_info << ","
+                 << g_pipe_geom.length << ","
+                 << g_pipe_geom.width << ","
+                 << g_pipe_geom.height << ","
+                 << g_pipe_geom.global_length << ","
+                 << g_pipe_geom.straight_confidence << "\n";
+    pipe_csv_log.flush();
+}
 
 void SigHandle(int sig)
 {
@@ -700,6 +753,26 @@ double quantile_from_sorted(vector<double> vec, double q)
     return vec[idx0] * (1.0 - t) + vec[idx1] * t;
 }
 
+double robust_trimmed_center(vector<double> vec, double q_low = 0.2, double q_high = 0.8)
+{
+    if (vec.empty()) return 0.0;
+    std::sort(vec.begin(), vec.end());
+    double low = quantile_from_sorted(vec, q_low);
+    double high = quantile_from_sorted(vec, q_high);
+    double sum = 0.0;
+    int count = 0;
+    for (double v : vec)
+    {
+        if (v >= low && v <= high)
+        {
+            sum += v;
+            ++count;
+        }
+    }
+    if (count <= 0) return quantile_from_sorted(vec, 0.5);
+    return sum / double(count);
+}
+
 bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
 {
     geom.valid = false;
@@ -779,28 +852,113 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     v_w.normalize();
     u_w = v_w.cross(axis_w).normalized();
 
+    // Keep cross-section basis orientation continuous across frames.
+    if (prev_pipe_basis_valid)
+    {
+        if (u_w.dot(prev_pipe_u_w) < 0.0) u_w = -u_w;
+        if (v_w.dot(prev_pipe_v_w) < 0.0) v_w = -v_w;
+    }
+    prev_pipe_u_w = u_w;
+    prev_pipe_v_w = v_w;
+    prev_pipe_basis_valid = true;
+
+    // Local frame origin only matters in u/v for box priors; shifting along axis is irrelevant.
     V3D axis_point_w = centroid - axis_w * (axis_w.dot(centroid));
+
     vector<double> t_coords, u_coords, v_coords;
+    vector<double> u_pos_wall, u_neg_wall, v_pos_wall, v_neg_wall;
     t_coords.reserve(world_pts.size());
     u_coords.reserve(world_pts.size());
     v_coords.reserve(world_pts.size());
-    for (const auto &p : world_pts)
+    u_pos_wall.reserve(world_pts.size());
+    u_neg_wall.reserve(world_pts.size());
+    v_pos_wall.reserve(world_pts.size());
+    v_neg_wall.reserve(world_pts.size());
+
+    for (size_t i = 0; i < world_pts.size(); ++i)
     {
+        const V3D &p = world_pts[i];
         V3D d = p - axis_point_w;
-        t_coords.push_back(d.dot(axis_w));
-        u_coords.push_back(d.dot(u_w));
-        v_coords.push_back(d.dot(v_w));
+        double t = d.dot(axis_w);
+        double u = d.dot(u_w);
+        double v = d.dot(v_w);
+        t_coords.push_back(t);
+        u_coords.push_back(u);
+        v_coords.push_back(v);
+
+        V3D n = normals[i] - axis_w * (axis_w.dot(normals[i]));
+        double nn = n.norm();
+        if (nn < 1e-3) continue;
+        n /= nn;
+        double nu = n.dot(u_w);
+        double nv = n.dot(v_w);
+        double dom = std::max(std::fabs(nu), std::fabs(nv));
+        if (dom < 0.35) continue;
+
+        if (std::fabs(nu) > std::fabs(nv))
+        {
+            if (nu >= 0.0) u_pos_wall.push_back(u);
+            else           u_neg_wall.push_back(u);
+        }
+        else
+        {
+            if (nv >= 0.0) v_pos_wall.push_back(v);
+            else           v_neg_wall.push_back(v);
+        }
     }
 
     double t_min = quantile_from_sorted(t_coords, 0.05);
     double t_max = quantile_from_sorted(t_coords, 0.95);
+    double length = t_max - t_min;
+
     double u_min = quantile_from_sorted(u_coords, 0.05);
     double u_max = quantile_from_sorted(u_coords, 0.95);
     double v_min = quantile_from_sorted(v_coords, 0.05);
     double v_max = quantile_from_sorted(v_coords, 0.95);
-    double length = t_max - t_min;
     double width = u_max - u_min;
     double height = v_max - v_min;
+
+    const size_t min_wall_samples = 6;
+    bool four_wall_fit_ok = (u_pos_wall.size() >= min_wall_samples &&
+                             u_neg_wall.size() >= min_wall_samples &&
+                             v_pos_wall.size() >= min_wall_samples &&
+                             v_neg_wall.size() >= min_wall_samples);
+
+    if (four_wall_fit_ok)
+    {
+        double u_pos = robust_trimmed_center(u_pos_wall, 0.15, 0.85);
+        double u_neg = robust_trimmed_center(u_neg_wall, 0.15, 0.85);
+        double v_pos = robust_trimmed_center(v_pos_wall, 0.15, 0.85);
+        double v_neg = robust_trimmed_center(v_neg_wall, 0.15, 0.85);
+
+        double u_low_raw = std::min(u_pos, u_neg);
+        double u_high_raw = std::max(u_pos, u_neg);
+        double v_low_raw = std::min(v_pos, v_neg);
+        double v_high_raw = std::max(v_pos, v_neg);
+
+        // Recentre the local frame on the estimated pipe centerline in the cross section.
+        double u_center = 0.5 * (u_low_raw + u_high_raw);
+        double v_center = 0.5 * (v_low_raw + v_high_raw);
+        axis_point_w = axis_point_w + u_center * u_w + v_center * v_w;
+
+        u_min = u_low_raw - u_center;
+        u_max = u_high_raw - u_center;
+        v_min = v_low_raw - v_center;
+        v_max = v_high_raw - v_center;
+        width = std::max(u_max, u_min) - std::min(u_max, u_min);
+        height = std::max(v_max, v_min) - std::min(v_max, v_min);
+    }
+
+    double u_low = std::min(u_max, u_min);
+    double u_high = std::max(u_max, u_min);
+    double v_low = std::min(v_max, v_min);
+    double v_high = std::max(v_max, v_min);
+    u_min = u_low;
+    u_max = u_high;
+    v_min = v_low;
+    v_max = v_high;
+    width = std::max(u_max, u_min) - std::min(u_max, u_min);
+    height = std::max(v_max, v_min) - std::min(v_max, v_min);
 
     bool size_ok = (width > pipe_min_width && width < pipe_max_width &&
                     height > pipe_min_height && height < pipe_max_height);
@@ -1185,6 +1343,8 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                           g_pipe_geom.straight_confidence);
     }
 
+    append_pipe_csv_log(Measures.lidar_beg_time, Measures.lidar_beg_time - first_lidar_time);
+
     solve_time += omp_get_wtime() - solve_start_;
 }
 
@@ -1287,6 +1447,9 @@ int main(int argc, char** argv)
         cout << "~~~~"<<ROOT_DIR<<" file opened" << endl;
     else
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
+
+    string pipe_csv_path = root_dir + "/Log/pipe_metrics.csv";
+    init_pipe_csv_log(pipe_csv_path);
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
@@ -1505,6 +1668,8 @@ int main(int argc, char** argv)
         }
         fclose(fp2);
     }
+
+    if (pipe_csv_log.is_open()) pipe_csv_log.close();
 
     return 0;
 }
