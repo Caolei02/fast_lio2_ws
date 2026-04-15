@@ -1,13 +1,27 @@
 pipe_prior:
-  enable: true
-  debug_log: true
-  weight_box: 8.0
-  weight_axis_align: 3.0
-  weight_motion: 1.5
-  min_width: 0.15
-  max_width: 0.80
-  min_height: 0.15
-  max_height: 0.80
-  axis_conf_threshold: 0.35
-  degenerate_min_eig: 0.05
-  degenerate_ratio: 0.15
+    enable: ture
+    debug_log: true
+    weight_box: 8.0
+    weight_axis_align: 3.0
+    weight_motion: 1.5
+    min_width: 0.20
+    max_width: 0.40
+    min_height: 0.20
+    max_height: 0.40
+    axis_conf_threshold: 0.50
+    degenerate_min_eig: 0.05
+    degenerate_ratio: 0.15
+    min_confidence: 0.80
+    max_motion_res: 0.03
+    max_box_res: 0.03
+    axis_only_until_stable: true
+
+    map_filter_enable: true
+    map_mid_section_gate_enable: true
+    map_mid_section_keep_ratio: 0.30
+    map_cross_section_margin: 0.015
+    map_wall_snap_tol: 0.01
+    map_min_range: 0.06
+    map_max_range: 1.00
+
+
