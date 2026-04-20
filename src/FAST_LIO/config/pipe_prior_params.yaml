@@ -1,27 +1,31 @@
 pipe_prior:
-    enable: ture
+    enable: true
     debug_log: true
-    weight_box: 8.0
-    weight_axis_align: 3.0
-    weight_motion: 1.5
-    min_width: 0.20
-    max_width: 0.40
-    min_height: 0.20
-    max_height: 0.40
-    axis_conf_threshold: 0.50
-    degenerate_min_eig: 0.05
-    degenerate_ratio: 0.15
-    min_confidence: 0.80
-    max_motion_res: 0.03
-    max_box_res: 0.03
-    axis_only_until_stable: true
+    weight_box: 15.0
+    weight_axis_align: 4.0
+    weight_motion: 2.5
+    min_width: 0.22
+    max_width: 0.75
+    min_height: 0.22
+    max_height: 0.75
+    axis_conf_threshold: 0.30
+    degenerate_min_eig: 1e-4
+    degenerate_ratio: 5e-3
+    mid_section_keep_ratio: 0.70
+    publish_projected_cloud: true
+    pcd_save_projected_cloud: true
+    wall_snap_max_dist: 0.02
+    wall_corner_margin: 0.015
+    frame_smooth_alpha: 0.15
+    size_smooth_alpha: 0.12
+    size_history_len: 60
+    min_valid_frames: 10
 
-    map_filter_enable: true
-    map_mid_section_gate_enable: true
-    map_mid_section_keep_ratio: 0.30
-    map_cross_section_margin: 0.015
-    map_wall_snap_tol: 0.01
-    map_min_range: 0.06
-    map_max_range: 1.00
-
-
+    max_iteration: 6
+    point_filter_num: 1
+    feature_extract_enable: false
+    runtime_pos_log_enable: 1
+    filter_size_corner: 0.02
+    filter_size_surf: 0.01
+    filter_size_map: 0.015
+    cube_side_length: 8.0
