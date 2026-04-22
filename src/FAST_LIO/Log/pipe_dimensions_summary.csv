@@ -1,2 +1,2 @@
-valid_frames,length,width,height,global_length,stable_width,stable_height
-38516,0.800273851,0.419505589,0.290932645,0.800273851,0.419505589,0.290932645
+valid_frames,length,width,height,global_length,stable_width,stable_height,rollback_count,recovery_entry_count
+0,0.000000000,0.000000000,0.000000000,0.000000000,0.000000000,0.000000000,0,0

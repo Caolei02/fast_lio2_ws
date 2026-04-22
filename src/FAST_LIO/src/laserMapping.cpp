@@ -39,9 +39,6 @@
 #include <fstream>
 #include <csignal>
 #include <unistd.h>
-#include <deque>
-#include <iomanip>
-#include <numeric>
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
@@ -199,40 +196,21 @@ V3D    prev_pipe_u_w = V3D(0.0, 1.0, 0.0);
 V3D    prev_pipe_v_w = V3D(0.0, 0.0, 1.0);
 bool   prev_pipe_basis_valid = false;
 double pipe_mid_section_keep_ratio = 0.60;
+double pipe_min_incidence_cos = 0.20;
+bool   pipe_apply_incidence_filter_in_lio = true;
+bool   pipe_enable_intensity_trim = true;
+double pipe_intensity_quantile_low = 0.05;
+double pipe_intensity_quantile_high = 0.95;
+bool   pipe_debug_print_filter_stats = false;
+bool   pipe_last_geom_used_intensity_trim = false;
+int    pipe_last_geom_raw_count = 0;
+int    pipe_last_geom_filtered_count = 0;
 bool   pipe_global_axis_initialized = false;
 double pipe_global_t_min = std::numeric_limits<double>::infinity();
 double pipe_global_t_max = -std::numeric_limits<double>::infinity();
 double pipe_global_length = 0.0;
 V3D    pipe_global_axis_w = V3D(1.0, 0.0, 0.0);
 ofstream pipe_csv_log;
-ofstream pipe_summary_csv_log;
-
-bool   pipe_publish_projected_cloud = true;
-bool   pipe_pcd_save_projected_cloud = true;
-double pipe_wall_snap_max_dist = 0.04;
-double pipe_wall_corner_margin = 0.03;
-double pipe_frame_smooth_alpha = 0.20;
-double pipe_size_smooth_alpha = 0.15;
-int    pipe_size_history_len = 80;
-int    pipe_min_valid_frames = 10;
-
-bool   pipe_stable_frame_initialized = false;
-V3D    pipe_stable_axis_w = V3D(1.0, 0.0, 0.0);
-V3D    pipe_stable_u_w = V3D(0.0, 1.0, 0.0);
-V3D    pipe_stable_v_w = V3D(0.0, 0.0, 1.0);
-V3D    pipe_stable_axis_point_w = Zero3d;
-bool   pipe_size_initialized = false;
-double pipe_width_est = 0.0;
-double pipe_height_est = 0.0;
-double pipe_length_est = 0.0;
-int    pipe_valid_frame_count = 0;
-deque<double> pipe_width_hist;
-deque<double> pipe_height_hist;
-deque<double> pipe_length_hist;
-
-double quantile_from_sorted(vector<double> vec, double q);
-double robust_trimmed_center(vector<double> vec, double q_low, double q_high);
-inline V3D pointBodyToWorldVec(const V3D &pi, const state_ikfom &s);
 
 void init_pipe_csv_log(const string &csv_path)
 {
@@ -245,23 +223,8 @@ void init_pipe_csv_log(const string &csv_path)
         return;
     }
 
-    pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,local_length,width,height,global_length,conf,u_pos_count,u_neg_count,v_pos_count,v_neg_count,four_wall_fit_ok\n";
+    pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,local_length,width,height,global_length,conf,u_pos_count,u_neg_count,v_pos_count,v_neg_count,four_wall_fit_ok,geom_raw_count,geom_filtered_count,intensity_trim_used\n";
     pipe_csv_log.flush();
-}
-
-void init_pipe_summary_csv_log(const string &csv_path)
-{
-    if (pipe_summary_csv_log.is_open()) return;
-
-    pipe_summary_csv_log.open(csv_path.c_str(), ios::out | ios::trunc);
-    if (!pipe_summary_csv_log.is_open())
-    {
-        ROS_WARN("failed to open pipe summary csv log: %s", csv_path.c_str());
-        return;
-    }
-
-    pipe_summary_csv_log << "valid_frames,length,width,height,global_length,stable_width,stable_height\n";
-    pipe_summary_csv_log.flush();
 }
 
 inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
@@ -286,52 +249,11 @@ inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
                  << g_pipe_geom.u_neg_count << ","
                  << g_pipe_geom.v_pos_count << ","
                  << g_pipe_geom.v_neg_count << ","
-                 << int(g_pipe_geom.four_wall_fit_ok) << "\n";
+                 << int(g_pipe_geom.four_wall_fit_ok) << ","
+                 << pipe_last_geom_raw_count << ","
+                 << pipe_last_geom_filtered_count << ","
+                 << int(pipe_last_geom_used_intensity_trim) << "\n";
     pipe_csv_log.flush();
-}
-
-inline void append_pipe_summary_csv_log()
-{
-    if (!pipe_summary_csv_log.is_open()) return;
-
-    double final_length = pipe_global_length > 0.0 ? pipe_global_length : pipe_length_est;
-    pipe_summary_csv_log << fixed << setprecision(9)
-                         << pipe_valid_frame_count << ","
-                         << final_length << ","
-                         << pipe_width_est << ","
-                         << pipe_height_est << ","
-                         << pipe_global_length << ","
-                         << pipe_width_est << ","
-                         << pipe_height_est << "\n";
-    pipe_summary_csv_log.flush();
-}
-
-inline void push_pipe_history(deque<double> &hist, double value)
-{
-    hist.push_back(value);
-    while (hist.size() > size_t(std::max(1, pipe_size_history_len))) hist.pop_front();
-}
-
-double robust_history_center(const deque<double> &hist)
-{
-    if (hist.empty()) return 0.0;
-    vector<double> vec(hist.begin(), hist.end());
-    return robust_trimmed_center(vec, 0.15, 0.85);
-}
-
-V3D smooth_unit_vector(const V3D &prev_vec, const V3D &cur_vec, double alpha)
-{
-    double a = std::max(0.0, std::min(1.0, alpha));
-    V3D prev_n = prev_vec;
-    V3D cur_n = cur_vec;
-    if (prev_n.norm() < 1e-9) return cur_n.normalized();
-    if (cur_n.norm() < 1e-9) return prev_n.normalized();
-    prev_n.normalize();
-    cur_n.normalize();
-    if (prev_n.dot(cur_n) < 0.0) cur_n = -cur_n;
-    V3D mixed = (1.0 - a) * prev_n + a * cur_n;
-    if (mixed.norm() < 1e-9) return cur_n;
-    return mixed.normalized();
 }
 
 void SigHandle(int sig)
@@ -669,278 +591,20 @@ void map_incremental()
 
 PointCloudXYZI::Ptr pcl_wait_pub(new PointCloudXYZI(500000, 1));
 PointCloudXYZI::Ptr pcl_wait_save(new PointCloudXYZI());
-bool project_point_to_pipe_wall(const V3D &p_world, const RectPipeGeomState &geom, V3D &p_proj)
-{
-    if (!geom.valid) return false;
-
-    V3D rel = p_world - geom.axis_point_w;
-    double t = rel.dot(geom.axis_w);
-    double u = rel.dot(geom.u_w);
-    double v = rel.dot(geom.v_w);
-
-    double t_margin = 0.10;
-    if (t < geom.t_min - t_margin || t > geom.t_max + t_margin) return false;
-
-    double du_min = std::fabs(u - geom.u_min);
-    double du_max = std::fabs(u - geom.u_max);
-    double dv_min = std::fabs(v - geom.v_min);
-    double dv_max = std::fabs(v - geom.v_max);
-
-    double best = du_min;
-    int wall_id = 0;
-    if (du_max < best) { best = du_max; wall_id = 1; }
-    if (dv_min < best) { best = dv_min; wall_id = 2; }
-    if (dv_max < best) { best = dv_max; wall_id = 3; }
-    if (best > pipe_wall_snap_max_dist) return false;
-
-    double u_proj = u;
-    double v_proj = v;
-    double corner_margin = std::max(0.0, pipe_wall_corner_margin);
-
-    if ((wall_id == 0 || wall_id == 1) &&
-        (v < geom.v_min - corner_margin || v > geom.v_max + corner_margin)) return false;
-    if ((wall_id == 2 || wall_id == 3) &&
-        (u < geom.u_min - corner_margin || u > geom.u_max + corner_margin)) return false;
-
-    if (wall_id == 0) u_proj = geom.u_min;
-    else if (wall_id == 1) u_proj = geom.u_max;
-    else if (wall_id == 2) v_proj = geom.v_min;
-    else v_proj = geom.v_max;
-
-    p_proj = geom.axis_point_w + geom.axis_w * t + geom.u_w * u_proj + geom.v_w * v_proj;
-    return true;
-}
-
-bool refine_pipe_geometry_with_full_scan(const state_ikfom &s, RectPipeGeomState &geom)
-{
-    if (!geom.valid) return false;
-    if (feats_undistort == nullptr || feats_undistort->points.size() < 40) return false;
-
-    struct CrossSample
-    {
-        double t = 0.0;
-        double u = 0.0;
-        double v = 0.0;
-    };
-
-    vector<CrossSample> samples;
-    vector<double> t_values;
-    samples.reserve(feats_undistort->points.size());
-    t_values.reserve(feats_undistort->points.size());
-
-    for (const auto &pt : feats_undistort->points)
-    {
-        V3D p_body(pt.x, pt.y, pt.z);
-        V3D p_world = pointBodyToWorldVec(p_body, s);
-        V3D rel = p_world - geom.axis_point_w;
-        CrossSample cs;
-        cs.t = rel.dot(geom.axis_w);
-        cs.u = rel.dot(geom.u_w);
-        cs.v = rel.dot(geom.v_w);
-        samples.push_back(cs);
-        t_values.push_back(cs.t);
-    }
-
-    if (t_values.size() < 40) return false;
-
-    double t_min = quantile_from_sorted(t_values, 0.02);
-    double t_max = quantile_from_sorted(t_values, 0.98);
-    double t_center = 0.5 * (t_min + t_max);
-    double half_keep = 0.5 * (t_max - t_min) * std::max(0.10, std::min(1.0, pipe_mid_section_keep_ratio));
-    double t_keep_min = t_center - half_keep;
-    double t_keep_max = t_center + half_keep;
-
-    vector<double> u_pos, u_neg, v_pos, v_neg;
-    u_pos.reserve(samples.size());
-    u_neg.reserve(samples.size());
-    v_pos.reserve(samples.size());
-    v_neg.reserve(samples.size());
-
-    double rough_half_w = 0.5 * std::max(1e-6, geom.width);
-    double rough_half_h = 0.5 * std::max(1e-6, geom.height);
-
-    for (const auto &cs : samples)
-    {
-        if (cs.t < t_keep_min || cs.t > t_keep_max) continue;
-        double abs_u = std::fabs(cs.u);
-        double abs_v = std::fabs(cs.v);
-        if (abs_u >= abs_v)
-        {
-            if (abs_u < 0.35 * rough_half_w) continue;
-            if (cs.u >= 0.0) u_pos.push_back(cs.u);
-            else             u_neg.push_back(cs.u);
-        }
-        else
-        {
-            if (abs_v < 0.35 * rough_half_h) continue;
-            if (cs.v >= 0.0) v_pos.push_back(cs.v);
-            else             v_neg.push_back(cs.v);
-        }
-    }
-
-    if (u_pos.size() < 12 || u_neg.size() < 12 || v_pos.size() < 12 || v_neg.size() < 12) return false;
-
-    double u_hi = robust_trimmed_center(u_pos, 0.10, 0.90);
-    double u_lo = robust_trimmed_center(u_neg, 0.10, 0.90);
-    double v_hi = robust_trimmed_center(v_pos, 0.10, 0.90);
-    double v_lo = robust_trimmed_center(v_neg, 0.10, 0.90);
-
-    double width = u_hi - u_lo;
-    double height = v_hi - v_lo;
-    if (width <= pipe_min_width || width >= pipe_max_width ||
-        height <= pipe_min_height || height >= pipe_max_height) return false;
-
-    double u_center = 0.5 * (u_hi + u_lo);
-    double v_center = 0.5 * (v_hi + v_lo);
-    geom.axis_point_w = geom.axis_point_w + u_center * geom.u_w + v_center * geom.v_w;
-    geom.u_min = u_lo - u_center;
-    geom.u_max = u_hi - u_center;
-    geom.v_min = v_lo - v_center;
-    geom.v_max = v_hi - v_center;
-    geom.t_min = t_min;
-    geom.t_max = t_max;
-    geom.length = std::max(0.0, t_max - t_min);
-    geom.width = width;
-    geom.height = height;
-    geom.four_wall_fit_ok = true;
-    return true;
-}
-
-void update_pipe_stable_state(const state_ikfom &s, RectPipeGeomState &geom)
-{
-    if (!geom.valid) return;
-
-    if (!pipe_stable_frame_initialized)
-    {
-        pipe_stable_axis_w = geom.axis_w;
-        pipe_stable_u_w = geom.u_w;
-        pipe_stable_v_w = geom.v_w;
-        pipe_stable_axis_point_w = geom.axis_point_w;
-        pipe_stable_frame_initialized = true;
-    }
-    else
-    {
-        pipe_stable_axis_w = smooth_unit_vector(pipe_stable_axis_w, geom.axis_w, pipe_frame_smooth_alpha);
-        pipe_stable_u_w = smooth_unit_vector(pipe_stable_u_w, geom.u_w, pipe_frame_smooth_alpha);
-        pipe_stable_v_w = pipe_stable_axis_w.cross(pipe_stable_u_w);
-        if (pipe_stable_v_w.norm() < 1e-9) pipe_stable_v_w = geom.v_w;
-        pipe_stable_v_w.normalize();
-        pipe_stable_u_w = pipe_stable_v_w.cross(pipe_stable_axis_w);
-        if (pipe_stable_u_w.norm() < 1e-9) pipe_stable_u_w = geom.u_w;
-        pipe_stable_u_w.normalize();
-        pipe_stable_axis_point_w = (1.0 - pipe_frame_smooth_alpha) * pipe_stable_axis_point_w + pipe_frame_smooth_alpha * geom.axis_point_w;
-    }
-
-    geom.axis_w = pipe_stable_axis_w;
-    geom.u_w = pipe_stable_u_w;
-    geom.v_w = pipe_stable_v_w;
-    geom.axis_point_w = pipe_stable_axis_point_w;
-
-    push_pipe_history(pipe_width_hist, geom.width);
-    push_pipe_history(pipe_height_hist, geom.height);
-    if (geom.length > 0.0) push_pipe_history(pipe_length_hist, geom.length);
-
-    double width_hist_center = robust_history_center(pipe_width_hist);
-    double height_hist_center = robust_history_center(pipe_height_hist);
-    double length_hist_center = robust_history_center(pipe_length_hist);
-
-    if (!pipe_size_initialized)
-    {
-        pipe_width_est = width_hist_center > 0.0 ? width_hist_center : geom.width;
-        pipe_height_est = height_hist_center > 0.0 ? height_hist_center : geom.height;
-        pipe_length_est = length_hist_center > 0.0 ? length_hist_center : geom.length;
-        pipe_size_initialized = true;
-    }
-    else
-    {
-        double beta = std::max(0.0, std::min(1.0, pipe_size_smooth_alpha));
-        if (width_hist_center > 0.0) pipe_width_est = (1.0 - beta) * pipe_width_est + beta * width_hist_center;
-        if (height_hist_center > 0.0) pipe_height_est = (1.0 - beta) * pipe_height_est + beta * height_hist_center;
-        if (length_hist_center > 0.0) pipe_length_est = (1.0 - beta) * pipe_length_est + beta * length_hist_center;
-    }
-
-    if (pipe_width_est > 0.0)
-    {
-        geom.u_min = -0.5 * pipe_width_est;
-        geom.u_max =  0.5 * pipe_width_est;
-        geom.width = pipe_width_est;
-    }
-    if (pipe_height_est > 0.0)
-    {
-        geom.v_min = -0.5 * pipe_height_est;
-        geom.v_max =  0.5 * pipe_height_est;
-        geom.height = pipe_height_est;
-    }
-
-    vector<double> t_global_values;
-    t_global_values.reserve(feats_undistort->points.size());
-    for (const auto &pt : feats_undistort->points)
-    {
-        V3D p_body(pt.x, pt.y, pt.z);
-        V3D p_world = pointBodyToWorldVec(p_body, s);
-        V3D p_eval = p_world;
-        V3D p_proj;
-        if (project_point_to_pipe_wall(p_world, geom, p_proj)) p_eval = p_proj;
-
-        V3D rel = p_eval - geom.axis_point_w;
-        double u = rel.dot(geom.u_w);
-        double v = rel.dot(geom.v_w);
-        double cross_margin = 0.05;
-        if (u < geom.u_min - cross_margin || u > geom.u_max + cross_margin ||
-            v < geom.v_min - cross_margin || v > geom.v_max + cross_margin) continue;
-        t_global_values.push_back(p_eval.dot(pipe_global_axis_initialized ? pipe_global_axis_w : geom.axis_w));
-    }
-
-    if (!t_global_values.empty())
-    {
-        double t_low = quantile_from_sorted(t_global_values, 0.02);
-        double t_high = quantile_from_sorted(t_global_values, 0.98);
-        if (!pipe_global_axis_initialized)
-        {
-            pipe_global_axis_w = geom.axis_w;
-            pipe_global_axis_initialized = true;
-        }
-        else
-        {
-            pipe_global_axis_w = smooth_unit_vector(pipe_global_axis_w, geom.axis_w, pipe_frame_smooth_alpha);
-        }
-        pipe_global_t_min = std::min(pipe_global_t_min, t_low);
-        pipe_global_t_max = std::max(pipe_global_t_max, t_high);
-        pipe_global_length = std::max(0.0, pipe_global_t_max - pipe_global_t_min);
-        geom.global_length = pipe_global_length;
-    }
-
-    ++pipe_valid_frame_count;
-}
-
 void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
 {
-    auto project_cloud_if_needed = [&](const PointCloudXYZI::Ptr &cloud_body, bool enable_projection)
-    {
-        int size = cloud_body->points.size();
-        PointCloudXYZI::Ptr cloud_world(new PointCloudXYZI(size, 1));
-        for (int i = 0; i < size; i++)
-        {
-            RGBpointBodyToWorld(&cloud_body->points[i], &cloud_world->points[i]);
-            if (enable_projection && g_pipe_geom.valid)
-            {
-                V3D p_world(cloud_world->points[i].x, cloud_world->points[i].y, cloud_world->points[i].z);
-                V3D p_proj;
-                if (project_point_to_pipe_wall(p_world, g_pipe_geom, p_proj))
-                {
-                    cloud_world->points[i].x = p_proj(0);
-                    cloud_world->points[i].y = p_proj(1);
-                    cloud_world->points[i].z = p_proj(2);
-                }
-            }
-        }
-        return cloud_world;
-    };
-
     if(scan_pub_en)
     {
         PointCloudXYZI::Ptr laserCloudFullRes(dense_pub_en ? feats_undistort : feats_down_body);
-        PointCloudXYZI::Ptr laserCloudWorld = project_cloud_if_needed(laserCloudFullRes, pipe_publish_projected_cloud);
+        int size = laserCloudFullRes->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
+
+        for (int i = 0; i < size; i++)
+        {
+            RGBpointBodyToWorld(&laserCloudFullRes->points[i], \
+                                &laserCloudWorld->points[i]);
+        }
 
         sensor_msgs::PointCloud2 laserCloudmsg;
         pcl::toROSMsg(*laserCloudWorld, laserCloudmsg);
@@ -955,7 +619,15 @@ void publish_frame_world(const ros::Publisher & pubLaserCloudFull)
     /* 2. noted that pcd save will influence the real-time performences **/
     if (pcd_save_en)
     {
-        PointCloudXYZI::Ptr laserCloudWorld = project_cloud_if_needed(feats_undistort, pipe_pcd_save_projected_cloud);
+        int size = feats_undistort->points.size();
+        PointCloudXYZI::Ptr laserCloudWorld( \
+                        new PointCloudXYZI(size, 1));
+
+        for (int i = 0; i < size; i++)
+        {
+            RGBpointBodyToWorld(&feats_undistort->points[i], \
+                                &laserCloudWorld->points[i]);
+        }
         *pcl_wait_save += *laserCloudWorld;
 
         static int scan_wait_num = 0;
@@ -1091,7 +763,7 @@ double quantile_from_sorted(vector<double> vec, double q)
     return vec[idx0] * (1.0 - t) + vec[idx1] * t;
 }
 
-double robust_trimmed_center(vector<double> vec, double q_low, double q_high)
+double robust_trimmed_center(vector<double> vec, double q_low = 0.2, double q_high = 0.8)
 {
     if (vec.empty()) return 0.0;
     std::sort(vec.begin(), vec.end());
@@ -1125,12 +797,18 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     geom.four_wall_fit_ok = false;
     if (effct_feat_num < 20) return false;
 
-    vector<V3D> normals;
-    vector<V3D> world_pts;
-    normals.reserve(effct_feat_num);
-    world_pts.reserve(effct_feat_num);
+    struct GeomCandidate
+    {
+        V3D p_world = Zero3d;
+        V3D normal_w = Zero3d;
+        double intensity = 0.0;
+        double cos_incidence = 1.0;
+    };
 
-    V3D centroid = Zero3d;
+    vector<GeomCandidate> raw_candidates;
+    raw_candidates.reserve(effct_feat_num);
+    V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+
     for (int i = 0; i < effct_feat_num; ++i)
     {
         const PointType &laser_p = laserCloudOri->points[i];
@@ -1138,11 +816,84 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
         V3D p_world = pointBodyToWorldVec(p_body, s);
         const PointType &norm_p = corr_normvect->points[i];
         V3D n(norm_p.x, norm_p.y, norm_p.z);
-        if (n.norm() < 1e-6) continue;
-        n.normalize();
-        world_pts.push_back(p_world);
-        normals.push_back(n);
-        centroid += p_world;
+        double n_norm = n.norm();
+        if (n_norm < 1e-6) continue;
+        n /= n_norm;
+
+        GeomCandidate cand;
+        cand.p_world = p_world;
+        cand.normal_w = n;
+        cand.intensity = laser_p.intensity;
+
+        V3D ray = p_world - lidar_pos_w;
+        double ray_norm = ray.norm();
+        if (ray_norm > 1e-6)
+        {
+            cand.cos_incidence = std::fabs(ray.dot(n) / ray_norm);
+        }
+
+        if (pipe_apply_incidence_filter_in_lio && cand.cos_incidence < pipe_min_incidence_cos)
+            continue;
+
+        raw_candidates.push_back(cand);
+    }
+
+    pipe_last_geom_raw_count = int(raw_candidates.size());
+    pipe_last_geom_filtered_count = pipe_last_geom_raw_count;
+    pipe_last_geom_used_intensity_trim = false;
+
+    if (raw_candidates.size() < 20) return false;
+
+    vector<GeomCandidate> geom_candidates = raw_candidates;
+    if (pipe_enable_intensity_trim && raw_candidates.size() >= 20)
+    {
+        vector<double> intensities;
+        intensities.reserve(raw_candidates.size());
+        for (const auto &cand : raw_candidates) intensities.push_back(cand.intensity);
+
+        double q_low = std::max(0.0, std::min(0.49, pipe_intensity_quantile_low));
+        double q_high = std::max(0.51, std::min(1.0, pipe_intensity_quantile_high));
+        if (q_high > q_low)
+        {
+            double i_low = quantile_from_sorted(intensities, q_low);
+            double i_high = quantile_from_sorted(intensities, q_high);
+            vector<GeomCandidate> trimmed;
+            trimmed.reserve(raw_candidates.size());
+            for (const auto &cand : raw_candidates)
+            {
+                if (cand.intensity >= i_low && cand.intensity <= i_high)
+                    trimmed.push_back(cand);
+            }
+            if (trimmed.size() >= 20)
+            {
+                geom_candidates.swap(trimmed);
+                pipe_last_geom_used_intensity_trim = true;
+            }
+        }
+    }
+
+    pipe_last_geom_filtered_count = int(geom_candidates.size());
+    if (pipe_debug_log && pipe_debug_print_filter_stats)
+    {
+        ROS_INFO_THROTTLE(1.0,
+                          "pipe geom filter raw=%d filtered=%d trim=%d min_cos=%.3f",
+                          pipe_last_geom_raw_count,
+                          pipe_last_geom_filtered_count,
+                          int(pipe_last_geom_used_intensity_trim),
+                          pipe_min_incidence_cos);
+    }
+
+    vector<V3D> normals;
+    vector<V3D> world_pts;
+    normals.reserve(geom_candidates.size());
+    world_pts.reserve(geom_candidates.size());
+
+    V3D centroid = Zero3d;
+    for (const auto &cand : geom_candidates)
+    {
+        world_pts.push_back(cand.p_world);
+        normals.push_back(cand.normal_w);
+        centroid += cand.p_world;
     }
 
     if (world_pts.size() < 20) return false;
@@ -1369,10 +1120,14 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
             pipe_global_axis_w = axis_w;
             pipe_global_axis_initialized = true;
         }
-        else
+
+        for (const auto &p : world_pts)
         {
-            pipe_global_axis_w = smooth_unit_vector(pipe_global_axis_w, axis_w, pipe_frame_smooth_alpha);
+            double t_global = p.dot(pipe_global_axis_w);
+            pipe_global_t_min = std::min(pipe_global_t_min, t_global);
+            pipe_global_t_max = std::max(pipe_global_t_max, t_global);
         }
+        pipe_global_length = pipe_global_t_max - pipe_global_t_min;
         geom.global_length = pipe_global_length;
     }
     else
@@ -1525,9 +1280,9 @@ void publish_pipe_size(const ros::Publisher &pubPipeSize)
     if (!g_pipe_geom.valid) return;
 
     geometry_msgs::Vector3 msg;
-    msg.x = g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : (pipe_length_est > 0.0 ? pipe_length_est : g_pipe_geom.length);
-    msg.y = pipe_width_est > 0.0 ? pipe_width_est : g_pipe_geom.width;
-    msg.z = pipe_height_est > 0.0 ? pipe_height_est : g_pipe_geom.height;
+    msg.x = g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : g_pipe_geom.length;
+    msg.y = g_pipe_geom.width;
+    msg.z = g_pipe_geom.height;
     pubPipeSize.publish(msg);
 }
 
@@ -1569,9 +1324,9 @@ void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
     marker.pose.orientation.z = q.z();
     marker.pose.orientation.w = q.w();
 
-    marker.scale.x = std::max(1e-3, g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : g_pipe_geom.length);
-    marker.scale.y = std::max(1e-3, pipe_width_est > 0.0 ? pipe_width_est : g_pipe_geom.width);
-    marker.scale.z = std::max(1e-3, pipe_height_est > 0.0 ? pipe_height_est : g_pipe_geom.height);
+    marker.scale.x = std::max(1e-3, g_pipe_geom.length);
+    marker.scale.y = std::max(1e-3, g_pipe_geom.width);
+    marker.scale.z = std::max(1e-3, g_pipe_geom.height);
 
     marker.color.r = 0.1f;
     marker.color.g = 0.9f;
@@ -1624,14 +1379,29 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         if (esti_plane(pabcd, points_near, 0.1f))
         {
             float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float s = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+            float score = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
 
-            if (s > 0.9)
+            if (score > 0.9)
             {
+                V3D plane_n(pabcd(0), pabcd(1), pabcd(2));
+                double plane_n_norm = plane_n.norm();
+                if (plane_n_norm < 1e-6) continue;
+                plane_n /= plane_n_norm;
+
+                if (pipe_apply_incidence_filter_in_lio)
+                {
+                    V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+                    V3D ray_dir = p_global - lidar_pos_w;
+                    double ray_norm = ray_dir.norm();
+                    if (ray_norm < 1e-6) continue;
+                    double cos_inc = std::fabs(ray_dir.dot(plane_n) / ray_norm);
+                    if (cos_inc < pipe_min_incidence_cos) continue;
+                }
+
                 point_selected_surf[i] = true;
-                normvec->points[i].x = pabcd(0);
-                normvec->points[i].y = pabcd(1);
-                normvec->points[i].z = pabcd(2);
+                normvec->points[i].x = plane_n(0);
+                normvec->points[i].y = plane_n(1);
+                normvec->points[i].z = plane_n(2);
                 normvec->points[i].intensity = pd2;
                 res_last[i] = abs(pd2);
             }
@@ -1699,11 +1469,6 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
 
     // ---- Rectangular pipe degeneracy detection and geometry-guided prior augmentation ----
     fit_rect_pipe_geometry(s, g_pipe_geom);
-    if (g_pipe_geom.valid)
-    {
-        refine_pipe_geometry_with_full_scan(s, g_pipe_geom);
-        update_pipe_stable_state(s, g_pipe_geom);
-    }
     analyze_degeneracy(ekfom_data.h_x, g_pipe_geom);
     augment_with_pipe_priors(s, g_pipe_geom, ekfom_data.h_x, ekfom_data.h);
 
@@ -1779,14 +1544,12 @@ int main(int argc, char** argv)
     nh.param<double>("pipe_prior/degenerate_min_eig", pipe_degenerate_min_eig, 1e-4);
     nh.param<double>("pipe_prior/degenerate_ratio", pipe_degenerate_ratio, 1e-3);
     nh.param<double>("pipe_prior/mid_section_keep_ratio", pipe_mid_section_keep_ratio, 0.60);
-    nh.param<bool>("pipe_prior/publish_projected_cloud", pipe_publish_projected_cloud, true);
-    nh.param<bool>("pipe_prior/pcd_save_projected_cloud", pipe_pcd_save_projected_cloud, true);
-    nh.param<double>("pipe_prior/wall_snap_max_dist", pipe_wall_snap_max_dist, 0.04);
-    nh.param<double>("pipe_prior/wall_corner_margin", pipe_wall_corner_margin, 0.03);
-    nh.param<double>("pipe_prior/frame_smooth_alpha", pipe_frame_smooth_alpha, 0.20);
-    nh.param<double>("pipe_prior/size_smooth_alpha", pipe_size_smooth_alpha, 0.15);
-    nh.param<int>("pipe_prior/size_history_len", pipe_size_history_len, 80);
-    nh.param<int>("pipe_prior/min_valid_frames", pipe_min_valid_frames, 10);
+    nh.param<double>("pipe_prior/min_incidence_cos", pipe_min_incidence_cos, 0.20);
+    nh.param<bool>("pipe_prior/apply_incidence_filter_in_lio", pipe_apply_incidence_filter_in_lio, true);
+    nh.param<bool>("pipe_prior/enable_intensity_trim", pipe_enable_intensity_trim, true);
+    nh.param<double>("pipe_prior/intensity_quantile_low", pipe_intensity_quantile_low, 0.05);
+    nh.param<double>("pipe_prior/intensity_quantile_high", pipe_intensity_quantile_high, 0.95);
+    nh.param<bool>("pipe_prior/debug_print_filter_stats", pipe_debug_print_filter_stats, false);
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -1839,8 +1602,6 @@ int main(int argc, char** argv)
 
     string pipe_csv_path = root_dir + "/Log/pipe_metrics.csv";
     init_pipe_csv_log(pipe_csv_path);
-    string pipe_summary_csv_path = root_dir + "/Log/pipe_dimensions_summary.csv";
-    init_pipe_summary_csv_log(pipe_summary_csv_path);
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
@@ -2040,8 +1801,6 @@ int main(int argc, char** argv)
         pcd_writer.writeBinary(all_points_dir, *pcl_wait_save);
     }
 
-    append_pipe_summary_csv_log();
-
     fout_out.close();
     fout_pre.close();
 
@@ -2064,7 +1823,6 @@ int main(int argc, char** argv)
     }
 
     if (pipe_csv_log.is_open()) pipe_csv_log.close();
-    if (pipe_summary_csv_log.is_open()) pipe_summary_csv_log.close();
 
     return 0;
 }
