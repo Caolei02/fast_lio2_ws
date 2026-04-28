@@ -148,6 +148,8 @@ shared_ptr<ImuProcess> p_imu(new ImuProcess());
 struct RectPipeGeomState
 {
     bool valid = false;
+    bool axis_reliable = false;
+    bool box_reliable = false;
     V3D axis_w = V3D(1.0, 0.0, 0.0);
     V3D u_w = V3D(0.0, 1.0, 0.0);
     V3D v_w = V3D(0.0, 0.0, 1.0);
@@ -172,6 +174,27 @@ struct RectPipeGeomState
     double straight_confidence = 0.0;
 };
 
+struct PipeEndCapState
+{
+    bool visible = false;
+    bool reliable = false;
+    bool matched_anchor = false;
+    int side = 0;              // -1: low-t slice, +1: high-t slice
+    int anchor_id = 0;         // 0: none, 1: entrance, 2: exit
+    V3D normal_w = V3D(1.0, 0.0, 0.0);
+    V3D center_w = Zero3d;
+    double plane_d = 0.0;
+    double axis_cos = 0.0;
+    double mean_abs_res = 0.0;
+    double span_u = 0.0;
+    double span_v = 0.0;
+    double s_meas = 0.0;
+    double s_anchor = 0.0;
+    int point_count = 0;
+    vector<V3D> points_body;
+};
+
+
 RectPipeGeomState g_pipe_geom;
 bool   pipe_prior_enable = true;
 bool   pipe_debug_log = false;
@@ -185,19 +208,36 @@ double pipe_min_height = 0.25;
 double pipe_max_height = 1.00;
 double pipe_axis_conf_threshold = 0.35;
 double pipe_degenerate_min_eig = 1e-4;
-double pipe_degenerate_ratio = 1e-3;
+double pipe_degenerate_ratio = 0.20;
 double pipe_last_min_eig = 0.0;
 double pipe_last_cond_num = 0.0;
 double pipe_last_axial_info = 0.0;
 double pipe_last_lateral_info = 0.0;
+double pipe_last_axial_ratio = 1.0;
+double pipe_last_min_pos_rel = 1.0;
+double pipe_last_u_info = 0.0;
+double pipe_last_v_info = 0.0;
+double pipe_degenerate_cond_thresh = 150.0;
+double pipe_degenerate_min_pos_rel = 0.10;
+int    pipe_degenerate_hold_frames = 3;
+bool   pipe_last_deg_by_abs_eig = false;
+bool   pipe_last_deg_by_rel_eig = false;
+bool   pipe_last_deg_by_axial_ratio = false;
+bool   pipe_last_deg_by_cond = false;
 V3D    prev_lidar_pos_world = Zero3d;
 bool   prev_lidar_pos_valid = false;
 V3D    prev_pipe_u_w = V3D(0.0, 1.0, 0.0);
 V3D    prev_pipe_v_w = V3D(0.0, 0.0, 1.0);
 bool   prev_pipe_basis_valid = false;
 double pipe_mid_section_keep_ratio = 0.60;
+double pipe_plane_score_gate = 0.70;
+double pipe_plane_abs_pd2_gate = 0.05;
+bool   pipe_map_filter_by_residual = true;
+bool   pipe_map_use_selected_points = true;
+double pipe_map_max_pd2 = 0.04;
 double pipe_min_incidence_cos = 0.20;
 bool   pipe_apply_incidence_filter_in_lio = true;
+bool   pipe_debug_match_stats = false;
 bool   pipe_enable_intensity_trim = true;
 double pipe_intensity_quantile_low = 0.05;
 double pipe_intensity_quantile_high = 0.95;
@@ -210,6 +250,37 @@ double pipe_global_t_min = std::numeric_limits<double>::infinity();
 double pipe_global_t_max = -std::numeric_limits<double>::infinity();
 double pipe_global_length = 0.0;
 V3D    pipe_global_axis_w = V3D(1.0, 0.0, 0.0);
+
+PipeEndCapState g_endcap;
+bool   pipe_endcap_enable = true;
+bool   pipe_endcap_init_origin = true;
+bool   pipe_endcap_use_prior = true;
+bool   pipe_endcap_learn_exit = true;
+double pipe_endcap_weight = 2.0;
+int    pipe_endcap_min_points = 25;
+int    pipe_endcap_max_prior_points = 80;
+double pipe_endcap_axis_cos_thresh = 0.85;
+double pipe_endcap_max_plane_res = 0.03;
+double pipe_endcap_slice_ratio = 0.18;
+double pipe_endcap_slice_min = 0.06;
+double pipe_endcap_min_cross_span = 0.08;
+double pipe_endcap_anchor_gate = 0.35;
+double pipe_endcap_exit_learn_min_s = 0.80;
+double pipe_endcap_known_length = -1.0;
+bool   pipe_endcap_fallback_enable = true;
+double pipe_endcap_fallback_gate = 0.60;
+int    pipe_endcap_entry_side = -1;  // -1: lower axial slice is entrance, +1: higher axial slice is entrance
+bool   pipe_origin_initialized = false;
+bool   pipe_start_cap_initialized = false;
+bool   pipe_exit_cap_initialized = false;
+V3D    pipe_origin_w = Zero3d;
+V3D    pipe_axis_anchor_w = V3D(1.0, 0.0, 0.0);
+V3D    pipe_start_cap_center_w = Zero3d;
+V3D    pipe_exit_cap_center_w = Zero3d;
+double pipe_start_cap_d = 0.0;
+double pipe_exit_cap_d = 0.0;
+double pipe_last_pipe_s = 0.0;
+
 ofstream pipe_csv_log;
 
 void init_pipe_csv_log(const string &csv_path)
@@ -223,7 +294,7 @@ void init_pipe_csv_log(const string &csv_path)
         return;
     }
 
-    pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,local_length,width,height,global_length,conf,u_pos_count,u_neg_count,v_pos_count,v_neg_count,four_wall_fit_ok,geom_raw_count,geom_filtered_count,intensity_trim_used\n";
+    pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,axial_ratio,min_pos_rel,u_info,v_info,deg_abs,deg_rel,deg_axis,deg_cond,local_length,width,height,global_length,conf,u_pos_count,u_neg_count,v_pos_count,v_neg_count,four_wall_fit_ok,geom_raw_count,geom_filtered_count,intensity_trim_used,axis_reliable,box_reliable,endcap_visible,endcap_reliable,endcap_anchor,endcap_points,endcap_s,endcap_s_anchor,endcap_res,pipe_s\n";
     pipe_csv_log.flush();
 }
 
@@ -240,6 +311,14 @@ inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
                  << pipe_last_cond_num << ","
                  << pipe_last_axial_info << ","
                  << pipe_last_lateral_info << ","
+                 << pipe_last_axial_ratio << ","
+                 << pipe_last_min_pos_rel << ","
+                 << pipe_last_u_info << ","
+                 << pipe_last_v_info << ","
+                 << int(pipe_last_deg_by_abs_eig) << ","
+                 << int(pipe_last_deg_by_rel_eig) << ","
+                 << int(pipe_last_deg_by_axial_ratio) << ","
+                 << int(pipe_last_deg_by_cond) << ","
                  << g_pipe_geom.length << ","
                  << g_pipe_geom.width << ","
                  << g_pipe_geom.height << ","
@@ -252,7 +331,17 @@ inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
                  << int(g_pipe_geom.four_wall_fit_ok) << ","
                  << pipe_last_geom_raw_count << ","
                  << pipe_last_geom_filtered_count << ","
-                 << int(pipe_last_geom_used_intensity_trim) << "\n";
+                 << int(pipe_last_geom_used_intensity_trim) << ","
+                 << int(g_pipe_geom.axis_reliable) << ","
+                 << int(g_pipe_geom.box_reliable) << ","
+                 << int(g_endcap.visible) << ","
+                 << int(g_endcap.reliable) << ","
+                 << g_endcap.anchor_id << ","
+                 << g_endcap.point_count << ","
+                 << g_endcap.s_meas << ","
+                 << g_endcap.s_anchor << ","
+                 << g_endcap.mean_abs_res << ","
+                 << pipe_last_pipe_s << "\n";
     pipe_csv_log.flush();
 }
 
@@ -546,10 +635,38 @@ void map_incremental()
     PointVector PointNoNeedDownsample;
     PointToAdd.reserve(feats_down_size);
     PointNoNeedDownsample.reserve(feats_down_size);
+
+    int map_skip_unselected = 0;
+    int map_skip_residual = 0;
+    int map_candidates = 0;
+
     for (int i = 0; i < feats_down_size; i++)
     {
         /* transform to world frame */
         pointBodyToWorld(&(feats_down_body->points[i]), &(feats_down_world->points[i]));
+
+        /*
+         * Pipe mode map protection:
+         * after EKF is initialized, do not insert every downsampled point into ikdtree.
+         * Only insert points that were actually accepted by the point-to-plane matcher
+         * and whose final absolute plane residual is small enough. This prevents
+         * a loose score gate from polluting the local map with thick walls or ghost points.
+         */
+        if (pipe_prior_enable && pipe_map_filter_by_residual && flg_EKF_inited)
+        {
+            if (pipe_map_use_selected_points && !point_selected_surf[i])
+            {
+                map_skip_unselected++;
+                continue;
+            }
+            if (!(res_last[i] >= 0.0f && res_last[i] <= static_cast<float>(pipe_map_max_pd2)))
+            {
+                map_skip_residual++;
+                continue;
+            }
+        }
+        map_candidates++;
+
         /* decide if need add to map */
         if (!Nearest_Points[i].empty() && flg_EKF_inited)
         {
@@ -580,6 +697,17 @@ void map_incremental()
         {
             PointToAdd.push_back(feats_down_world->points[i]);
         }
+    }
+
+    if ((pipe_debug_match_stats || pipe_debug_log) && pipe_prior_enable && pipe_map_filter_by_residual && flg_EKF_inited)
+    {
+        ROS_WARN_STREAM_THROTTLE(1.0, "[DBG_MAP_FILTER] feats_down_size=" << feats_down_size
+                                 << " candidates=" << map_candidates
+                                 << " skip_unselected=" << map_skip_unselected
+                                 << " skip_residual=" << map_skip_residual
+                                 << " map_max_pd2=" << pipe_map_max_pd2
+                                 << " add_voxel=" << PointToAdd.size()
+                                 << " add_direct=" << PointNoNeedDownsample.size());
     }
 
     double st_time = omp_get_wtime();
@@ -786,6 +914,8 @@ double robust_trimmed_center(vector<double> vec, double q_low = 0.2, double q_hi
 bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
 {
     geom.valid = false;
+    geom.axis_reliable = false;
+    geom.box_reliable = false;
     geom.length = 0.0;
     geom.width = 0.0;
     geom.height = 0.0;
@@ -1090,7 +1220,9 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
                     height > pipe_min_height && height < pipe_max_height);
     double straight_conf = std::min(1.0, std::max(0.0, (normal_planarity - 0.5) / 0.5));
 
-    geom.valid = size_ok && (straight_conf > pipe_axis_conf_threshold);
+    geom.axis_reliable = (straight_conf > pipe_axis_conf_threshold);
+    geom.box_reliable = geom.axis_reliable && four_wall_fit_ok && size_ok;
+    geom.valid = geom.box_reliable;
     geom.axis_w = axis_w;
     geom.u_w = u_w;
     geom.v_w = v_w;
@@ -1113,7 +1245,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     geom.normal_planarity = normal_planarity;
     geom.straight_confidence = straight_conf;
 
-    if (geom.valid)
+    if (geom.axis_reliable)
     {
         if (!pipe_global_axis_initialized)
         {
@@ -1135,7 +1267,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
         geom.global_length = pipe_global_length;
     }
 
-    return geom.valid;
+    return geom.axis_reliable;
 }
 
 void analyze_degeneracy(const MatrixXd &Hx, const RectPipeGeomState &geom)
@@ -1144,34 +1276,128 @@ void analyze_degeneracy(const MatrixXd &Hx, const RectPipeGeomState &geom)
     pipe_last_cond_num = 0.0;
     pipe_last_axial_info = 0.0;
     pipe_last_lateral_info = 0.0;
+    pipe_last_axial_ratio = 1.0;
+    pipe_last_min_pos_rel = 1.0;
+    pipe_last_u_info = 0.0;
+    pipe_last_v_info = 0.0;
+    pipe_last_deg_by_abs_eig = false;
+    pipe_last_deg_by_rel_eig = false;
+    pipe_last_deg_by_axial_ratio = false;
+    pipe_last_deg_by_cond = false;
     pipe_degenerate = false;
 
-    if (Hx.rows() < 6) return;
+    static int deg_hold = 0;
+    if (Hx.rows() < 6)
+    {
+        deg_hold = std::max(0, deg_hold - 1);
+        pipe_degenerate = (deg_hold > 0);
+        return;
+    }
 
+    const double eps = 1e-12;
     Matrix<double, 6, 6> info = Hx.leftCols(6).transpose() * Hx.leftCols(6);
     Eigen::SelfAdjointEigenSolver<Matrix<double, 6, 6>> solver(info);
-    if (solver.info() != Eigen::Success) return;
+    if (solver.info() != Eigen::Success)
+    {
+        deg_hold = std::max(0, deg_hold - 1);
+        pipe_degenerate = (deg_hold > 0);
+        return;
+    }
 
-    auto vals = solver.eigenvalues();
+    const auto vals = solver.eigenvalues();
     pipe_last_min_eig = vals(0);
-    pipe_last_cond_num = vals(5) / std::max(1e-12, vals(0));
+    pipe_last_cond_num = vals(5) / std::max(eps, vals(0));
 
     Matrix3d info_pos = info.block<3, 3>(0, 0);
-    if (geom.valid)
+    Eigen::SelfAdjointEigenSolver<Matrix3d> pos_solver(info_pos);
+    if (pos_solver.info() != Eigen::Success)
     {
-        pipe_last_axial_info = geom.axis_w.transpose() * info_pos * geom.axis_w;
-        Matrix3d Pperp = Matrix3d::Identity() - geom.axis_w * geom.axis_w.transpose();
-        pipe_last_lateral_info = (Pperp * info_pos * Pperp).trace() / 2.0;
+        deg_hold = std::max(0, deg_hold - 1);
+        pipe_degenerate = (deg_hold > 0);
+        return;
+    }
+
+    const auto pos_vals = pos_solver.eigenvalues();
+    const auto pos_vecs = pos_solver.eigenvectors();
+    const double pos_mean = std::max(eps, pos_vals.mean());
+    pipe_last_min_pos_rel = pos_vals(0) / pos_mean;
+
+    bool use_pipe_axis = false;
+    V3D axis_for_test = pos_vecs.col(0).normalized();
+
+    if (geom.axis_reliable && geom.axis_w.norm() > 0.5)
+    {
+        // The pipe axis is allowed to drive degeneracy detection even when the
+        // rectangle size is not reliable enough for box priors.
+        axis_for_test = geom.axis_w.normalized();
+        use_pipe_axis = true;
+
+        V3D u_for_test = geom.u_w;
+        V3D v_for_test = geom.v_w;
+        if (u_for_test.norm() > 0.5 && v_for_test.norm() > 0.5)
+        {
+            u_for_test.normalize();
+            v_for_test.normalize();
+            pipe_last_u_info = u_for_test.transpose() * info_pos * u_for_test;
+            pipe_last_v_info = v_for_test.transpose() * info_pos * v_for_test;
+            pipe_last_lateral_info = 0.5 * (pipe_last_u_info + pipe_last_v_info);
+        }
+        else
+        {
+            Matrix3d Pperp = Matrix3d::Identity() - axis_for_test * axis_for_test.transpose();
+            pipe_last_lateral_info = (Pperp * info_pos * Pperp).trace() / 2.0;
+            pipe_last_u_info = pipe_last_lateral_info;
+            pipe_last_v_info = pipe_last_lateral_info;
+        }
+
+        pipe_last_axial_info = axis_for_test.transpose() * info_pos * axis_for_test;
     }
     else
     {
-        pipe_last_axial_info = info_pos.trace() / 3.0;
-        pipe_last_lateral_info = pipe_last_axial_info;
+        // When the pipe axis is not reliable yet, do not force axial == lateral.
+        // Use the weakest positional eigen-direction as a temporary degeneracy
+        // direction, so the detector can still see ill-conditioned motion.
+        pipe_last_axial_info = std::max(eps, pos_vals(0));
+        pipe_last_lateral_info = std::max(eps, 0.5 * (pos_vals(1) + pos_vals(2)));
+        pipe_last_u_info = pos_vals(1);
+        pipe_last_v_info = pos_vals(2);
     }
 
-    bool min_eig_bad = pipe_last_min_eig < pipe_degenerate_min_eig;
-    bool axial_ratio_bad = pipe_last_axial_info < std::max(1e-12, pipe_last_lateral_info) * pipe_degenerate_ratio;
-    pipe_degenerate = min_eig_bad || axial_ratio_bad;
+    pipe_last_axial_info = std::max(eps, pipe_last_axial_info);
+    pipe_last_lateral_info = std::max(eps, pipe_last_lateral_info);
+    pipe_last_axial_ratio = pipe_last_axial_info / pipe_last_lateral_info;
+
+    pipe_last_deg_by_abs_eig = pipe_last_min_eig < pipe_degenerate_min_eig;
+    pipe_last_deg_by_rel_eig = pipe_last_min_pos_rel < pipe_degenerate_min_pos_rel;
+    pipe_last_deg_by_axial_ratio = pipe_last_axial_ratio < pipe_degenerate_ratio;
+    pipe_last_deg_by_cond = pipe_last_cond_num > pipe_degenerate_cond_thresh;
+
+    bool deg_now = false;
+    if (use_pipe_axis)
+    {
+        // In pipe mode, axial/lateral contrast is the most meaningful signal.
+        deg_now = pipe_last_deg_by_axial_ratio ||
+                  pipe_last_deg_by_rel_eig ||
+                  pipe_last_deg_by_cond ||
+                  pipe_last_deg_by_abs_eig;
+    }
+    else
+    {
+        // Before the pipe axis is reliable, avoid applying pipe priors, but still
+        // expose degeneracy in the logs through relative eigenvalue and condition
+        // number tests.
+        deg_now = pipe_last_deg_by_rel_eig ||
+                  pipe_last_deg_by_cond ||
+                  pipe_last_deg_by_abs_eig;
+    }
+
+    int hold_frames = std::max(0, pipe_degenerate_hold_frames);
+    if (deg_now)
+        deg_hold = hold_frames;
+    else
+        deg_hold = std::max(0, deg_hold - 1);
+
+    pipe_degenerate = deg_now || (deg_hold > 0);
 }
 
 void augment_with_pipe_priors(const state_ikfom &s,
@@ -1179,7 +1405,7 @@ void augment_with_pipe_priors(const state_ikfom &s,
                               MatrixXd &Hx,
                               VectorXd &h)
 {
-    if (!pipe_prior_enable || !pipe_degenerate || !geom.valid) return;
+    if (!pipe_prior_enable || !pipe_degenerate || !geom.axis_reliable) return;
 
     vector<RowVectorXd> rows;
     vector<double> residuals;
@@ -1215,31 +1441,34 @@ void augment_with_pipe_priors(const state_ikfom &s,
         }
     }
 
-    // Soft rectangular box prior: keep LiDAR pose inside the fitted cross section.
-    V3D rel = lidar_pos_w - geom.axis_point_w;
-    double u = rel.dot(geom.u_w);
-    double v = rel.dot(geom.v_w);
-    double margin = 0.05;
-    std::array<double, 4> box_res = {
-        std::max(0.0, u - (geom.u_max + margin)),
-        std::max(0.0, (geom.u_min - margin) - u),
-        std::max(0.0, v - (geom.v_max + margin)),
-        std::max(0.0, (geom.v_min - margin) - v)
-    };
-    std::array<V3D, 4> box_grads = {
-        geom.u_w,
-        -geom.u_w,
-        geom.v_w,
-        -geom.v_w
-    };
-    for (int j = 0; j < 4; ++j)
+    if (geom.box_reliable)
     {
-        if (box_res[j] <= 0.0) continue;
-        RowVectorXd row = RowVectorXd::Zero(12);
-        row.block<1, 3>(0, 0) = pipe_prior_weight * box_grads[j].transpose();
-        row.block<1, 3>(0, 3) = pipe_prior_weight * (box_grads[j].transpose() * (-skewMatrix(s.rot * s.offset_T_L_I)));
-        rows.push_back(row);
-        residuals.push_back(-pipe_prior_weight * box_res[j]);
+        // Soft rectangular box prior: keep LiDAR pose inside the fitted cross section.
+        V3D rel = lidar_pos_w - geom.axis_point_w;
+        double u = rel.dot(geom.u_w);
+        double v = rel.dot(geom.v_w);
+        double margin = 0.05;
+        std::array<double, 4> box_res = {
+            std::max(0.0, u - (geom.u_max + margin)),
+            std::max(0.0, (geom.u_min - margin) - u),
+            std::max(0.0, v - (geom.v_max + margin)),
+            std::max(0.0, (geom.v_min - margin) - v)
+        };
+        std::array<V3D, 4> box_grads = {
+            geom.u_w,
+            -geom.u_w,
+            geom.v_w,
+            -geom.v_w
+        };
+        for (int j = 0; j < 4; ++j)
+        {
+            if (box_res[j] <= 0.0) continue;
+            RowVectorXd row = RowVectorXd::Zero(12);
+            row.block<1, 3>(0, 0) = pipe_prior_weight * box_grads[j].transpose();
+            row.block<1, 3>(0, 3) = pipe_prior_weight * (box_grads[j].transpose() * (-skewMatrix(s.rot * s.offset_T_L_I)));
+            rows.push_back(row);
+            residuals.push_back(-pipe_prior_weight * box_res[j]);
+        }
     }
 
     if (rows.empty()) return;
@@ -1277,7 +1506,7 @@ void publish_path(const ros::Publisher pubPath)
 
 void publish_pipe_size(const ros::Publisher &pubPipeSize)
 {
-    if (!g_pipe_geom.valid) return;
+    if (!g_pipe_geom.box_reliable) return;
 
     geometry_msgs::Vector3 msg;
     msg.x = g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : g_pipe_geom.length;
@@ -1294,7 +1523,7 @@ void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
     marker.ns = "pipe_bbox";
     marker.id = 0;
 
-    if (!g_pipe_geom.valid)
+    if (!g_pipe_geom.box_reliable)
     {
         marker.action = visualization_msgs::Marker::DELETE;
         pubPipeBBox.publish(marker);
@@ -1336,6 +1565,460 @@ void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
     pubPipeBBox.publish(marker);
 }
 
+// ---------------- Pipe entrance / exit end-cap landmark support ----------------
+bool fit_endcap_candidate_from_indices(const state_ikfom &s,
+                                       const vector<int> &indices,
+                                       const vector<V3D> &pts_world,
+                                       const vector<V3D> &pts_body,
+                                       const V3D &axis_w,
+                                       const V3D &u_w,
+                                       const V3D &v_w,
+                                       int side,
+                                       PipeEndCapState &cap)
+{
+    cap = PipeEndCapState();
+    cap.side = side;
+
+    if (int(indices.size()) < pipe_endcap_min_points) return false;
+
+    V3D centroid = Zero3d;
+    for (int idx : indices) centroid += pts_world[idx];
+    centroid /= double(indices.size());
+
+    M3D cov = M3D::Zero();
+    for (int idx : indices)
+    {
+        V3D d = pts_world[idx] - centroid;
+        cov += d * d.transpose();
+    }
+    cov /= std::max(1.0, double(indices.size()));
+
+    Eigen::SelfAdjointEigenSolver<M3D> solver(cov);
+    if (solver.info() != Eigen::Success) return false;
+
+    V3D n = solver.eigenvectors().col(0).normalized();
+    if (n.dot(axis_w) < 0.0) n = -n;
+
+    double axis_cos = std::fabs(n.dot(axis_w));
+    if (axis_cos < pipe_endcap_axis_cos_thresh) return false;
+
+    double mean_abs_res = 0.0;
+    vector<double> us, vs;
+    us.reserve(indices.size());
+    vs.reserve(indices.size());
+    for (int idx : indices)
+    {
+        V3D d = pts_world[idx] - centroid;
+        mean_abs_res += std::fabs(n.dot(d));
+        us.push_back(d.dot(u_w));
+        vs.push_back(d.dot(v_w));
+    }
+    mean_abs_res /= double(indices.size());
+    if (mean_abs_res > pipe_endcap_max_plane_res) return false;
+
+    std::sort(us.begin(), us.end());
+    std::sort(vs.begin(), vs.end());
+    double span_u = quantile_from_sorted(us, 0.90) - quantile_from_sorted(us, 0.10);
+    double span_v = quantile_from_sorted(vs, 0.90) - quantile_from_sorted(vs, 0.10);
+    if (std::max(span_u, span_v) < pipe_endcap_min_cross_span) return false;
+
+    cap.visible = true;
+    cap.reliable = true;
+    cap.normal_w = n;
+    cap.center_w = centroid;
+    cap.plane_d = -n.dot(centroid);
+    cap.axis_cos = axis_cos;
+    cap.mean_abs_res = mean_abs_res;
+    cap.span_u = span_u;
+    cap.span_v = span_v;
+    cap.point_count = int(indices.size());
+    cap.points_body.reserve(indices.size());
+    for (int idx : indices) cap.points_body.push_back(pts_body[idx]);
+    return true;
+}
+
+void update_endcap_anchor(const state_ikfom &s, PipeEndCapState &cap)
+{
+    if (!cap.reliable) return;
+
+    if (pipe_endcap_init_origin && !pipe_origin_initialized)
+    {
+        pipe_origin_w = cap.center_w;
+        pipe_axis_anchor_w = cap.normal_w.normalized();
+        pipe_start_cap_center_w = pipe_origin_w;
+        pipe_start_cap_d = -pipe_axis_anchor_w.dot(pipe_start_cap_center_w);
+        pipe_origin_initialized = true;
+        pipe_start_cap_initialized = true;
+        cap.anchor_id = 1;
+        cap.matched_anchor = true;
+        cap.s_meas = 0.0;
+        cap.s_anchor = 0.0;
+        ROS_WARN_STREAM("[ENDCAP] initialized entrance end-cap origin. axis=("
+                        << pipe_axis_anchor_w(0) << ", " << pipe_axis_anchor_w(1) << ", " << pipe_axis_anchor_w(2) << ")");
+        return;
+    }
+
+    if (!pipe_origin_initialized) return;
+
+    cap.s_meas = (cap.center_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+    pipe_last_pipe_s = (s.pos + s.rot * s.offset_T_L_I - pipe_origin_w).dot(pipe_axis_anchor_w);
+
+    double dist_start = std::fabs(cap.s_meas);
+    double dist_exit = std::numeric_limits<double>::infinity();
+    if (pipe_endcap_known_length > 0.0)
+        dist_exit = std::fabs(cap.s_meas - pipe_endcap_known_length);
+    else if (pipe_exit_cap_initialized)
+        dist_exit = std::fabs((cap.center_w - pipe_exit_cap_center_w).dot(pipe_axis_anchor_w));
+
+    if (dist_start <= dist_exit && pipe_start_cap_initialized && dist_start < pipe_endcap_anchor_gate)
+    {
+        cap.anchor_id = 1;
+        cap.matched_anchor = true;
+        cap.s_anchor = 0.0;
+        return;
+    }
+
+    if (pipe_endcap_known_length > 0.0 && dist_exit < pipe_endcap_anchor_gate)
+    {
+        pipe_exit_cap_center_w = pipe_origin_w + pipe_axis_anchor_w * pipe_endcap_known_length;
+        pipe_exit_cap_d = -pipe_axis_anchor_w.dot(pipe_exit_cap_center_w);
+        pipe_exit_cap_initialized = true;
+        cap.anchor_id = 2;
+        cap.matched_anchor = true;
+        cap.s_anchor = pipe_endcap_known_length;
+        return;
+    }
+
+    if (pipe_endcap_learn_exit && pipe_endcap_known_length <= 0.0 &&
+        !pipe_exit_cap_initialized && cap.s_meas > pipe_endcap_exit_learn_min_s)
+    {
+        pipe_exit_cap_center_w = cap.center_w;
+        pipe_exit_cap_d = -pipe_axis_anchor_w.dot(pipe_exit_cap_center_w);
+        pipe_exit_cap_initialized = true;
+        cap.anchor_id = 2;
+        cap.matched_anchor = true;
+        cap.s_anchor = cap.s_meas;
+        ROS_WARN_STREAM("[ENDCAP] learned exit end-cap at s=" << cap.s_anchor << " m");
+        return;
+    }
+
+    if (pipe_exit_cap_initialized && dist_exit < pipe_endcap_anchor_gate)
+    {
+        cap.anchor_id = 2;
+        cap.matched_anchor = true;
+        cap.s_anchor = (pipe_exit_cap_center_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+    }
+}
+
+bool detect_pipe_endcap(const state_ikfom &s, const RectPipeGeomState &geom, PipeEndCapState &best_cap)
+{
+    best_cap = PipeEndCapState();
+    if (!pipe_prior_enable || !pipe_endcap_enable || feats_down_size < pipe_endcap_min_points) return false;
+
+    V3D lidar_forward_w = s.rot * (s.offset_R_L_I * V3D(1.0, 0.0, 0.0));
+    V3D axis_w = lidar_forward_w.normalized();
+    if (geom.axis_reliable) axis_w = geom.axis_w.normalized();
+    else if (pipe_origin_initialized) axis_w = pipe_axis_anchor_w.normalized();
+    if (axis_w.dot(lidar_forward_w) < 0.0) axis_w = -axis_w;
+
+    V3D u_w = geom.u_w;
+    V3D v_w = geom.v_w;
+    if (geom.axis_reliable == false)
+    {
+        V3D ref = std::fabs(axis_w.z()) < 0.9 ? V3D(0, 0, 1) : V3D(0, 1, 0);
+        u_w = (ref - axis_w * axis_w.dot(ref)).normalized();
+        v_w = axis_w.cross(u_w).normalized();
+    }
+
+    vector<V3D> pts_world;
+    vector<V3D> pts_body;
+    vector<double> t_vals;
+    pts_world.reserve(feats_down_size);
+    pts_body.reserve(feats_down_size);
+    t_vals.reserve(feats_down_size);
+
+    V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+    for (int i = 0; i < feats_down_size; ++i)
+    {
+        const PointType &pb = feats_down_body->points[i];
+        V3D p_body(pb.x, pb.y, pb.z);
+        V3D p_world = pointBodyToWorldVec(p_body, s);
+        pts_body.push_back(p_body);
+        pts_world.push_back(p_world);
+        t_vals.push_back((p_world - lidar_pos_w).dot(axis_w));
+    }
+
+    vector<double> t_sorted = t_vals;
+    std::sort(t_sorted.begin(), t_sorted.end());
+    double t05 = quantile_from_sorted(t_sorted, 0.05);
+    double t95 = quantile_from_sorted(t_sorted, 0.95);
+    double span_t = t95 - t05;
+    if (span_t < 1e-3) return false;
+
+    double slice = std::max(pipe_endcap_slice_min, span_t * std::max(0.05, pipe_endcap_slice_ratio));
+    vector<int> low_idx, high_idx;
+    low_idx.reserve(feats_down_size);
+    high_idx.reserve(feats_down_size);
+    for (size_t i = 0; i < t_vals.size(); ++i)
+    {
+        if (t_vals[i] <= t05 + slice) low_idx.push_back(int(i));
+        if (t_vals[i] >= t95 - slice) high_idx.push_back(int(i));
+    }
+
+    PipeEndCapState low_cap, high_cap;
+    bool low_ok = fit_endcap_candidate_from_indices(s, low_idx, pts_world, pts_body, axis_w, u_w, v_w, -1, low_cap);
+    bool high_ok = fit_endcap_candidate_from_indices(s, high_idx, pts_world, pts_body, axis_w, u_w, v_w, +1, high_cap);
+
+    double low_score = low_ok ? (low_cap.axis_cos * low_cap.point_count / std::max(1e-3, low_cap.mean_abs_res + 0.01)) : -1.0;
+    double high_score = high_ok ? (high_cap.axis_cos * high_cap.point_count / std::max(1e-3, high_cap.mean_abs_res + 0.01)) : -1.0;
+
+    if (!low_ok && !high_ok) return false;
+    best_cap = (high_score > low_score) ? high_cap : low_cap;
+    update_endcap_anchor(s, best_cap);
+    return best_cap.reliable;
+}
+
+// Detect both entrance/exit end-cap candidates directly from the current frame.
+// This function does not depend on successful map nearest-neighbor matching, so it can run before
+// the "No Effective Points" early return and can provide a fallback landmark update.
+bool detect_pipe_endcaps(const state_ikfom &s,
+                         const RectPipeGeomState &geom,
+                         vector<PipeEndCapState> &caps)
+{
+    caps.clear();
+    if (!pipe_prior_enable || !pipe_endcap_enable || feats_down_size < pipe_endcap_min_points) return false;
+
+    V3D lidar_forward_w = s.rot * (s.offset_R_L_I * V3D(1.0, 0.0, 0.0));
+    if (lidar_forward_w.norm() < 1e-6) lidar_forward_w = V3D(1.0, 0.0, 0.0);
+    V3D axis_w = lidar_forward_w.normalized();
+
+    if (pipe_origin_initialized) axis_w = pipe_axis_anchor_w.normalized();
+    else if (geom.axis_reliable) axis_w = geom.axis_w.normalized();
+    else if (pipe_global_axis_initialized) axis_w = pipe_global_axis_w.normalized();
+
+    if (axis_w.dot(lidar_forward_w) < 0.0) axis_w = -axis_w;
+
+    V3D u_w = geom.u_w;
+    V3D v_w = geom.v_w;
+    if (!geom.axis_reliable)
+    {
+        V3D ref = std::fabs(axis_w.z()) < 0.9 ? V3D(0, 0, 1) : V3D(0, 1, 0);
+        u_w = ref - axis_w * axis_w.dot(ref);
+        if (u_w.norm() < 1e-6) u_w = V3D(0, 1, 0);
+        u_w.normalize();
+        v_w = axis_w.cross(u_w);
+        if (v_w.norm() < 1e-6) return false;
+        v_w.normalize();
+    }
+
+    vector<V3D> pts_world;
+    vector<V3D> pts_body;
+    vector<double> t_vals;
+    pts_world.reserve(feats_down_size);
+    pts_body.reserve(feats_down_size);
+    t_vals.reserve(feats_down_size);
+
+    V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+    for (int i = 0; i < feats_down_size; ++i)
+    {
+        const PointType &pb = feats_down_body->points[i];
+        V3D p_body(pb.x, pb.y, pb.z);
+        V3D p_world = pointBodyToWorldVec(p_body, s);
+        pts_body.push_back(p_body);
+        pts_world.push_back(p_world);
+        t_vals.push_back((p_world - lidar_pos_w).dot(axis_w));
+    }
+
+    vector<double> t_sorted = t_vals;
+    std::sort(t_sorted.begin(), t_sorted.end());
+    double t05 = quantile_from_sorted(t_sorted, 0.05);
+    double t95 = quantile_from_sorted(t_sorted, 0.95);
+    double span_t = t95 - t05;
+    if (span_t < 1e-3) return false;
+
+    double slice = std::max(pipe_endcap_slice_min, span_t * std::max(0.05, pipe_endcap_slice_ratio));
+    vector<int> low_idx, high_idx;
+    low_idx.reserve(feats_down_size);
+    high_idx.reserve(feats_down_size);
+    for (size_t i = 0; i < t_vals.size(); ++i)
+    {
+        if (t_vals[i] <= t05 + slice) low_idx.push_back(int(i));
+        if (t_vals[i] >= t95 - slice) high_idx.push_back(int(i));
+    }
+
+    PipeEndCapState low_cap, high_cap;
+    bool low_ok = fit_endcap_candidate_from_indices(s, low_idx, pts_world, pts_body, axis_w, u_w, v_w, -1, low_cap);
+    bool high_ok = fit_endcap_candidate_from_indices(s, high_idx, pts_world, pts_body, axis_w, u_w, v_w, +1, high_cap);
+
+    if (!low_ok && !high_ok) return false;
+
+    // During initialization, bind the configured entrance side first. This prevents a visible exit
+    // plate from accidentally becoming s=0 when both end-caps are visible.
+    if (!pipe_origin_initialized && pipe_endcap_init_origin)
+    {
+        PipeEndCapState *entry = nullptr;
+        PipeEndCapState *other = nullptr;
+        if (pipe_endcap_entry_side <= 0)
+        {
+            if (low_ok) entry = &low_cap;
+            if (high_ok) other = &high_cap;
+        }
+        else
+        {
+            if (high_ok) entry = &high_cap;
+            if (low_ok) other = &low_cap;
+        }
+        if (!entry)
+        {
+            if (low_ok) entry = &low_cap;
+            else if (high_ok) entry = &high_cap;
+        }
+        if (entry) update_endcap_anchor(s, *entry);
+        if (other && other->reliable) update_endcap_anchor(s, *other);
+    }
+    else
+    {
+        if (low_ok) update_endcap_anchor(s, low_cap);
+        if (high_ok) update_endcap_anchor(s, high_cap);
+    }
+
+    if (low_ok) caps.push_back(low_cap);
+    if (high_ok) caps.push_back(high_cap);
+
+    return !caps.empty();
+}
+
+PipeEndCapState choose_best_endcap_for_log(const vector<PipeEndCapState> &caps)
+{
+    PipeEndCapState best;
+    double best_score = -1.0;
+    for (const auto &cap : caps)
+    {
+        if (!cap.reliable) continue;
+        double anchor_bonus = cap.matched_anchor ? 10.0 : 1.0;
+        double score = anchor_bonus * cap.axis_cos * double(cap.point_count) / std::max(1e-3, cap.mean_abs_res + 0.01);
+        if (score > best_score)
+        {
+            best_score = score;
+            best = cap;
+        }
+    }
+    return best;
+}
+
+bool append_endcap_rows(const state_ikfom &s,
+                        const PipeEndCapState &cap,
+                        int cols,
+                        double weight,
+                        double gate,
+                        vector<RowVectorXd> &rows,
+                        vector<double> &residuals)
+{
+    if (!cap.reliable || !cap.matched_anchor || cap.points_body.empty()) return false;
+    if (weight <= 0.0 || cols < 6) return false;
+
+    V3D n = pipe_axis_anchor_w.normalized();
+    double d = pipe_start_cap_d;
+    if (cap.anchor_id == 2) d = pipe_exit_cap_d;
+    if (cap.anchor_id == 0) return false;
+
+    int max_pts = std::max(1, pipe_endcap_max_prior_points);
+    int step = std::max(1, int(cap.points_body.size()) / max_pts);
+    int before = int(rows.size());
+
+    for (size_t i = 0; i < cap.points_body.size(); i += step)
+    {
+        const V3D &p_body = cap.points_body[i];
+        V3D p_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
+        V3D p_world = s.rot * p_imu + s.pos;
+        double r = n.dot(p_world) + d;
+        if (gate > 0.0 && std::fabs(r) > gate) continue;
+
+        M3D point_crossmat;
+        point_crossmat << SKEW_SYM_MATRX(p_imu);
+        V3D C(s.rot.conjugate() * n);
+        V3D A(point_crossmat * C);
+
+        RowVectorXd row = RowVectorXd::Zero(cols);
+        if (extrinsic_est_en && cols >= 12)
+        {
+            M3D point_body_crossmat;
+            point_body_crossmat << SKEW_SYM_MATRX(p_body);
+            V3D B(point_body_crossmat * s.offset_R_L_I.conjugate() * C);
+            row.block<1, 12>(0, 0) << n(0), n(1), n(2), VEC_FROM_ARRAY(A), VEC_FROM_ARRAY(B), VEC_FROM_ARRAY(C);
+        }
+        else
+        {
+            row.block<1, 3>(0, 0) = n.transpose();
+            row.block<1, 3>(0, 3) = A.transpose();
+        }
+        rows.push_back(weight * row);
+        residuals.push_back(-weight * r);
+    }
+
+    return int(rows.size()) > before;
+}
+
+bool build_endcap_fallback_measurement(const state_ikfom &s,
+                                       const vector<PipeEndCapState> &caps,
+                                       MatrixXd &Hx,
+                                       VectorXd &h)
+{
+    if (!pipe_prior_enable || !pipe_endcap_enable || !pipe_endcap_fallback_enable) return false;
+    if (caps.empty()) return false;
+
+    vector<RowVectorXd> rows;
+    vector<double> residuals;
+    rows.reserve(pipe_endcap_max_prior_points * std::max(1, int(caps.size())));
+    residuals.reserve(pipe_endcap_max_prior_points * std::max(1, int(caps.size())));
+
+    const int cols = 12;
+    for (const auto &cap : caps)
+        append_endcap_rows(s, cap, cols, pipe_endcap_weight, pipe_endcap_fallback_gate, rows, residuals);
+
+    if (rows.empty()) return false;
+
+    Hx = MatrixXd::Zero(int(rows.size()), cols);
+    h.resize(int(rows.size()));
+    for (int i = 0; i < int(rows.size()); ++i)
+    {
+        Hx.row(i) = rows[i];
+        h(i) = residuals[i];
+    }
+    return true;
+}
+
+
+void augment_with_endcap_prior(const state_ikfom &s,
+                               const PipeEndCapState &cap,
+                               MatrixXd &Hx,
+                               VectorXd &h)
+{
+    if (!pipe_prior_enable || !pipe_endcap_enable || !pipe_endcap_use_prior) return;
+    if (pipe_endcap_weight <= 0.0) return;
+
+    vector<RowVectorXd> rows;
+    vector<double> residuals;
+    rows.reserve(pipe_endcap_max_prior_points);
+    residuals.reserve(pipe_endcap_max_prior_points);
+
+    if (!append_endcap_rows(s, cap, Hx.cols(), pipe_endcap_weight, pipe_endcap_anchor_gate, rows, residuals)) return;
+
+    int old_rows = Hx.rows();
+    int add_rows = rows.size();
+    MatrixXd Hx_aug(old_rows + add_rows, Hx.cols());
+    VectorXd h_aug(old_rows + add_rows);
+    Hx_aug.topRows(old_rows) = Hx;
+    h_aug.head(old_rows) = h;
+    for (int i = 0; i < add_rows; ++i)
+    {
+        Hx_aug.row(old_rows + i) = rows[i];
+        h_aug(old_rows + i) = residuals[i];
+    }
+    Hx.swap(Hx_aug);
+    h.swap(h_aug);
+}
+
 void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_data)
 {
     double match_start = omp_get_wtime();
@@ -1343,13 +2026,30 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     corr_normvect->clear(); 
     total_residual = 0.0; 
 
+    int dbg_total = 0;
+    int dbg_nn_ok = 0;
+    int dbg_plane_ok = 0;
+    int dbg_score_ok = 0;
+    int dbg_abs_gate_reject = 0;
+    int dbg_inc_reject = 0;
+    int dbg_final = 0;
+    int dbg_pd2_abs_lt_005 = 0;
+    int dbg_pd2_abs_lt_010 = 0;
+    int dbg_pd2_abs_lt_020 = 0;
+    double dbg_pd2_abs_sum = 0.0;
+    double dbg_pd2_abs_sum_score_ok = 0.0;
+    const float dbg_score_gate = static_cast<float>(std::max(0.0, std::min(1.0, pipe_plane_score_gate)));
+    const float dbg_abs_pd2_gate = static_cast<float>(pipe_plane_abs_pd2_gate);
+
     /** closest surface search and residual computation **/
     #ifdef MP_EN
         omp_set_num_threads(MP_PROC_NUM);
-        #pragma omp parallel for
+        #pragma omp parallel for reduction(+:dbg_total, dbg_nn_ok, dbg_plane_ok, dbg_score_ok, dbg_abs_gate_reject, dbg_inc_reject, dbg_final, dbg_pd2_abs_lt_005, dbg_pd2_abs_lt_010, dbg_pd2_abs_lt_020, dbg_pd2_abs_sum, dbg_pd2_abs_sum_score_ok)
     #endif
     for (int i = 0; i < feats_down_size; i++)
     {
+        dbg_total++;
+
         PointType &point_body  = feats_down_body->points[i]; 
         PointType &point_world = feats_down_world->points[i]; 
 
@@ -1372,17 +2072,38 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
             point_selected_surf[i] = points_near.size() < NUM_MATCH_POINTS ? false : pointSearchSqDis[NUM_MATCH_POINTS - 1] > 5 ? false : true;
         }
 
+        if (point_selected_surf[i]) dbg_nn_ok++;
         if (!point_selected_surf[i]) continue;
 
         VF(4) pabcd;
         point_selected_surf[i] = false;
         if (esti_plane(pabcd, points_near, 0.1f))
         {
-            float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
-            float score = 1 - 0.9 * fabs(pd2) / sqrt(p_body.norm());
+            dbg_plane_ok++;
 
-            if (score > 0.9)
+            float pd2 = pabcd(0) * point_world.x + pabcd(1) * point_world.y + pabcd(2) * point_world.z + pabcd(3);
+            float abs_pd2 = fabs(pd2);
+            float score = 1 - 0.9 * abs_pd2 / sqrt(p_body.norm());
+
+            dbg_pd2_abs_sum += abs_pd2;
+            if (abs_pd2 < 0.05f) dbg_pd2_abs_lt_005++;
+            if (abs_pd2 < 0.10f) dbg_pd2_abs_lt_010++;
+            if (abs_pd2 < 0.20f) dbg_pd2_abs_lt_020++;
+
+            // Absolute residual gate for narrow rectangular pipes.
+            // The original score gate is range-dependent and becomes too loose
+            // at 0.5 to 1.0 m. This hard gate rejects thick-wall and ghost matches.
+            if (dbg_abs_pd2_gate > 0.0f && abs_pd2 > dbg_abs_pd2_gate)
             {
+                dbg_abs_gate_reject++;
+                continue;
+            }
+
+            if (score > dbg_score_gate)
+            {
+                dbg_score_ok++;
+                dbg_pd2_abs_sum_score_ok += abs_pd2;
+
                 V3D plane_n(pabcd(0), pabcd(1), pabcd(2));
                 double plane_n_norm = plane_n.norm();
                 if (plane_n_norm < 1e-6) continue;
@@ -1395,10 +2116,15 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                     double ray_norm = ray_dir.norm();
                     if (ray_norm < 1e-6) continue;
                     double cos_inc = std::fabs(ray_dir.dot(plane_n) / ray_norm);
-                    if (cos_inc < pipe_min_incidence_cos) continue;
+                    if (cos_inc < pipe_min_incidence_cos)
+                    {
+                        dbg_inc_reject++;
+                        continue;
+                    }
                 }
 
                 point_selected_surf[i] = true;
+                dbg_final++;
                 normvec->points[i].x = plane_n(0);
                 normvec->points[i].y = plane_n(1);
                 normvec->points[i].z = plane_n(2);
@@ -1421,10 +2147,67 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
+    if (pipe_debug_match_stats || pipe_debug_log || effct_feat_num < 1)
+    {
+        double plane_mean_abs_pd2 = dbg_plane_ok > 0 ? dbg_pd2_abs_sum / dbg_plane_ok : 0.0;
+        double score_ok_mean_abs_pd2 = dbg_score_ok > 0 ? dbg_pd2_abs_sum_score_ok / dbg_score_ok : 0.0;
+        double plane_ratio = dbg_total > 0 ? static_cast<double>(dbg_plane_ok) / dbg_total : 0.0;
+        double score_ratio_in_plane = dbg_plane_ok > 0 ? static_cast<double>(dbg_score_ok) / dbg_plane_ok : 0.0;
+
+        ROS_WARN_STREAM("[DBG_MATCH] feats_down_size=" << feats_down_size
+                        << " total=" << dbg_total
+                        << " nn_ok=" << dbg_nn_ok
+                        << " plane_ok=" << dbg_plane_ok
+                        << " score_ok=" << dbg_score_ok
+                        << " abs_gate_reject=" << dbg_abs_gate_reject
+                        << " inc_reject=" << dbg_inc_reject
+                        << " final=" << dbg_final
+                        << " eff=" << effct_feat_num
+                        << " kdtree_size=" << ikdtree.size()
+                        << " score_gate=" << dbg_score_gate
+                        << " abs_pd2_gate=" << dbg_abs_pd2_gate
+                        << " plane_ratio=" << plane_ratio
+                        << " score_ratio_in_plane=" << score_ratio_in_plane
+                        << " mean_abs_pd2=" << plane_mean_abs_pd2
+                        << " mean_abs_pd2_score_ok=" << score_ok_mean_abs_pd2
+                        << " pd2_lt_0p05=" << dbg_pd2_abs_lt_005
+                        << " pd2_lt_0p10=" << dbg_pd2_abs_lt_010
+                        << " pd2_lt_0p20=" << dbg_pd2_abs_lt_020);
+    }
+
+    // Detect entrance/exit end-cap landmarks before the early return.
+    // This allows the sealed pipe end-caps to act as fallback axial anchors when ordinary
+    // FAST-LIO point-to-map matching temporarily fails.
+    vector<PipeEndCapState> pre_endcaps;
+    detect_pipe_endcaps(s, g_pipe_geom, pre_endcaps);
+    if (!pre_endcaps.empty()) g_endcap = choose_best_endcap_for_log(pre_endcaps);
+
     if (effct_feat_num < 1)
     {
+        if (build_endcap_fallback_measurement(s, pre_endcaps, ekfom_data.h_x, ekfom_data.h))
+        {
+            ekfom_data.valid = true;
+            res_mean_last = 0.0;
+            if (pipe_origin_initialized)
+            {
+                V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+                pipe_last_pipe_s = (lidar_pos_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+            }
+            if (pipe_debug_log || pipe_debug_match_stats)
+            {
+                ROS_WARN_STREAM("[ENDCAP_FALLBACK] using " << ekfom_data.h_x.rows()
+                                << " end-cap rows. anchor=" << g_endcap.anchor_id
+                                << " pts=" << g_endcap.point_count
+                                << " s=" << g_endcap.s_meas
+                                << " s_ref=" << g_endcap.s_anchor
+                                << " res=" << g_endcap.mean_abs_res
+                                << " pipe_s=" << pipe_last_pipe_s);
+            }
+            return;
+        }
+
         ekfom_data.valid = false;
-        ROS_WARN("No Effective Points! \n");
+        ROS_WARN("No Effective Points!");
         return;
     }
 
@@ -1467,26 +2250,55 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         ekfom_data.h(i) = -norm_p.intensity;
     }
 
-    // ---- Rectangular pipe degeneracy detection and geometry-guided prior augmentation ----
+    // ---- Rectangular pipe degeneracy detection, end-cap landmark detection, and prior augmentation ----
     fit_rect_pipe_geometry(s, g_pipe_geom);
+    vector<PipeEndCapState> current_endcaps;
+    detect_pipe_endcaps(s, g_pipe_geom, current_endcaps);
+    if (!current_endcaps.empty()) g_endcap = choose_best_endcap_for_log(current_endcaps);
     analyze_degeneracy(ekfom_data.h_x, g_pipe_geom);
     augment_with_pipe_priors(s, g_pipe_geom, ekfom_data.h_x, ekfom_data.h);
+    for (const auto &cap : current_endcaps)
+        augment_with_endcap_prior(s, cap, ekfom_data.h_x, ekfom_data.h);
+
+    if (pipe_origin_initialized)
+    {
+        V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+        pipe_last_pipe_s = (lidar_pos_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+    }
 
     if (pipe_debug_log)
     {
         ROS_INFO_THROTTLE(0.5,
-                          "pipe valid=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e local_size=(L=%.3f, W=%.3f, H=%.3f) global_L=%.3f conf=%.3f",
+                          "pipe valid=%d axis=%d box=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e ratio=%.3f min_pos_rel=%.3f u=%.3e v=%.3e deg_src(abs=%d rel=%d axis=%d cond=%d) local_size=(L=%.3f, W=%.3f, H=%.3f) global_L=%.3f conf=%.3f endcap(vis=%d rel=%d anchor=%d pts=%d s=%.3f s_ref=%.3f res=%.3f) pipe_s=%.3f",
                           g_pipe_geom.valid,
+                          g_pipe_geom.axis_reliable,
+                          g_pipe_geom.box_reliable,
                           pipe_degenerate,
                           pipe_last_min_eig,
                           pipe_last_cond_num,
                           pipe_last_axial_info,
                           pipe_last_lateral_info,
+                          pipe_last_axial_ratio,
+                          pipe_last_min_pos_rel,
+                          pipe_last_u_info,
+                          pipe_last_v_info,
+                          pipe_last_deg_by_abs_eig,
+                          pipe_last_deg_by_rel_eig,
+                          pipe_last_deg_by_axial_ratio,
+                          pipe_last_deg_by_cond,
                           g_pipe_geom.length,
                           g_pipe_geom.width,
                           g_pipe_geom.height,
                           g_pipe_geom.global_length,
-                          g_pipe_geom.straight_confidence);
+                          g_pipe_geom.straight_confidence,
+                          g_endcap.visible,
+                          g_endcap.reliable,
+                          g_endcap.anchor_id,
+                          g_endcap.point_count,
+                          g_endcap.s_meas,
+                          g_endcap.s_anchor,
+                          g_endcap.mean_abs_res,
+                          pipe_last_pipe_s);
     }
 
 
@@ -1542,14 +2354,63 @@ int main(int argc, char** argv)
     nh.param<double>("pipe_prior/max_height", pipe_max_height, 1.00);
     nh.param<double>("pipe_prior/axis_conf_threshold", pipe_axis_conf_threshold, 0.35);
     nh.param<double>("pipe_prior/degenerate_min_eig", pipe_degenerate_min_eig, 1e-4);
-    nh.param<double>("pipe_prior/degenerate_ratio", pipe_degenerate_ratio, 1e-3);
+    nh.param<double>("pipe_prior/degenerate_ratio", pipe_degenerate_ratio, 0.20);
+    nh.param<double>("pipe_prior/degenerate_cond_thresh", pipe_degenerate_cond_thresh, 150.0);
+    nh.param<double>("pipe_prior/degenerate_min_pos_rel", pipe_degenerate_min_pos_rel, 0.10);
+    nh.param<int>("pipe_prior/degenerate_hold_frames", pipe_degenerate_hold_frames, 3);
     nh.param<double>("pipe_prior/mid_section_keep_ratio", pipe_mid_section_keep_ratio, 0.60);
+    nh.param<double>("pipe_prior/plane_score_gate", pipe_plane_score_gate, 0.70);
+    nh.param<double>("pipe_prior/plane_abs_pd2_gate", pipe_plane_abs_pd2_gate, 0.05);
+    nh.param<bool>("pipe_prior/map_filter_by_residual", pipe_map_filter_by_residual, true);
+    nh.param<bool>("pipe_prior/map_use_selected_points", pipe_map_use_selected_points, true);
+    nh.param<double>("pipe_prior/map_max_pd2", pipe_map_max_pd2, 0.04);
     nh.param<double>("pipe_prior/min_incidence_cos", pipe_min_incidence_cos, 0.20);
     nh.param<bool>("pipe_prior/apply_incidence_filter_in_lio", pipe_apply_incidence_filter_in_lio, true);
+    nh.param<bool>("pipe_prior/debug_match_stats", pipe_debug_match_stats, false);
     nh.param<bool>("pipe_prior/enable_intensity_trim", pipe_enable_intensity_trim, true);
     nh.param<double>("pipe_prior/intensity_quantile_low", pipe_intensity_quantile_low, 0.05);
     nh.param<double>("pipe_prior/intensity_quantile_high", pipe_intensity_quantile_high, 0.95);
     nh.param<bool>("pipe_prior/debug_print_filter_stats", pipe_debug_print_filter_stats, false);
+    nh.param<bool>("pipe_prior/endcap_enable", pipe_endcap_enable, true);
+    nh.param<bool>("pipe_prior/endcap_init_origin", pipe_endcap_init_origin, true);
+    nh.param<bool>("pipe_prior/endcap_use_prior", pipe_endcap_use_prior, true);
+    nh.param<bool>("pipe_prior/endcap_learn_exit", pipe_endcap_learn_exit, true);
+    nh.param<double>("pipe_prior/endcap_weight", pipe_endcap_weight, 2.0);
+    nh.param<int>("pipe_prior/endcap_min_points", pipe_endcap_min_points, 25);
+    nh.param<int>("pipe_prior/endcap_max_prior_points", pipe_endcap_max_prior_points, 80);
+    nh.param<double>("pipe_prior/endcap_axis_cos_thresh", pipe_endcap_axis_cos_thresh, 0.85);
+    nh.param<double>("pipe_prior/endcap_max_plane_res", pipe_endcap_max_plane_res, 0.03);
+    nh.param<double>("pipe_prior/endcap_slice_ratio", pipe_endcap_slice_ratio, 0.18);
+    nh.param<double>("pipe_prior/endcap_slice_min", pipe_endcap_slice_min, 0.06);
+    nh.param<double>("pipe_prior/endcap_min_cross_span", pipe_endcap_min_cross_span, 0.08);
+    nh.param<double>("pipe_prior/endcap_anchor_gate", pipe_endcap_anchor_gate, 0.35);
+    nh.param<double>("pipe_prior/endcap_exit_learn_min_s", pipe_endcap_exit_learn_min_s, 0.80);
+    nh.param<double>("pipe_prior/endcap_known_length", pipe_endcap_known_length, -1.0);
+    nh.param<bool>("pipe_prior/endcap_fallback_enable", pipe_endcap_fallback_enable, true);
+    nh.param<double>("pipe_prior/endcap_fallback_gate", pipe_endcap_fallback_gate, 0.60);
+    nh.param<int>("pipe_prior/endcap_entry_side", pipe_endcap_entry_side, -1);
+
+    ROS_WARN_STREAM("[PIPE PARAM] apply_incidence_filter_in_lio=" << pipe_apply_incidence_filter_in_lio);
+    ROS_WARN_STREAM("[PIPE PARAM] min_incidence_cos=" << pipe_min_incidence_cos);
+    ROS_WARN_STREAM("[PIPE PARAM] axis_conf_threshold=" << pipe_axis_conf_threshold);
+    ROS_WARN_STREAM("[PIPE PARAM] mid_section_keep_ratio=" << pipe_mid_section_keep_ratio);
+    ROS_WARN_STREAM("[PIPE PARAM] degenerate_ratio=" << pipe_degenerate_ratio);
+    ROS_WARN_STREAM("[PIPE PARAM] degenerate_cond_thresh=" << pipe_degenerate_cond_thresh);
+    ROS_WARN_STREAM("[PIPE PARAM] degenerate_min_pos_rel=" << pipe_degenerate_min_pos_rel);
+    ROS_WARN_STREAM("[PIPE PARAM] degenerate_hold_frames=" << pipe_degenerate_hold_frames);
+    ROS_WARN_STREAM("[PIPE PARAM] plane_score_gate=" << pipe_plane_score_gate);
+    ROS_WARN_STREAM("[PIPE PARAM] plane_abs_pd2_gate=" << pipe_plane_abs_pd2_gate);
+    ROS_WARN_STREAM("[PIPE PARAM] map_filter_by_residual=" << pipe_map_filter_by_residual);
+    ROS_WARN_STREAM("[PIPE PARAM] map_use_selected_points=" << pipe_map_use_selected_points);
+    ROS_WARN_STREAM("[PIPE PARAM] map_max_pd2=" << pipe_map_max_pd2);
+    ROS_WARN_STREAM("[PIPE PARAM] debug_match_stats=" << pipe_debug_match_stats);
+    ROS_WARN_STREAM("[PIPE PARAM] endcap_enable=" << pipe_endcap_enable
+                    << " endcap_use_prior=" << pipe_endcap_use_prior
+                    << " endcap_weight=" << pipe_endcap_weight
+                    << " fallback=" << pipe_endcap_fallback_enable
+                    << " fallback_gate=" << pipe_endcap_fallback_gate
+                    << " entry_side=" << pipe_endcap_entry_side
+                    << " known_length=" << pipe_endcap_known_length);
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;

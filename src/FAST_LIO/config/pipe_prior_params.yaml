@@ -1,50 +1,66 @@
 pipe_prior:
     enable: true
     debug_log: true
+    debug_match_stats: true
 
-    weight_box: 8.0
-    weight_axis_align: 3.0
-    weight_motion: 1.5
+    # Front-end point-to-plane gates
+    plane_score_gate: 0.75
+    plane_abs_pd2_gate: 0.05
 
+    # Keep pipe priors off first; validate end-cap detection and fallback first
+    weight_box: 0.0
+    weight_axis_align: 0.0
+    weight_motion: 0.0
+
+    # Pipe size range, m
     min_width: 0.20
-    max_width: 0.40
+    max_width: 0.73
     min_height: 0.20
-    max_height: 0.40
-    axis_conf_threshold: 0.50
+    max_height: 0.73
+    axis_conf_threshold: 0.35
 
+    # Degeneracy diagnostics
     degenerate_min_eig: 0.05
-    degenerate_ratio: 0.15
+    degenerate_ratio: 0.20
+    degenerate_cond_thresh: 200.0
+    degenerate_min_pos_rel: 0.08
+    degenerate_hold_frames: 2
 
-    min_confidence: 0.80
-    max_motion_res: 0.03
-    max_box_res: 0.03
-    axis_only_until_stable: true
-
+    # Incidence and intensity filtering
     min_incidence_cos: 0.30
-    apply_incidence_filter_in_lio: true
-
+    apply_incidence_filter_in_lio: false
     enable_intensity_trim: true
     intensity_quantile_low: 0.10
     intensity_quantile_high: 0.90
     debug_print_filter_stats: false
+    mid_section_keep_ratio: 0.50
 
-    mid_section_keep_ratio: 0.35
+    # Conservative map update baseline
+    map_filter_by_residual: true
+    map_use_selected_points: true
+    map_max_pd2: 0.04
 
-    map_filter_enable: true
-    map_mid_section_gate_enable: true
-    map_mid_section_keep_ratio: 0.30
-    map_cross_section_margin: 0.008
-    map_wall_snap_tol: 0.010
-    map_min_range: 0.06
-    map_max_range: 1.00
+    # Entrance/exit end-cap landmark
+    endcap_enable: true
+    endcap_init_origin: true
+    endcap_use_prior: true
+    endcap_fallback_enable: true
+    endcap_learn_exit: true
+    endcap_weight: 0.8
+    endcap_min_points: 25
+    endcap_max_prior_points: 80
+    endcap_axis_cos_thresh: 0.85
+    endcap_max_plane_res: 0.03
+    endcap_slice_ratio: 0.18
+    endcap_slice_min: 0.06
+    endcap_min_cross_span: 0.08
+    endcap_anchor_gate: 0.35
+    endcap_fallback_gate: 0.60
 
-    require_geom_for_map_update: true
-    require_four_wall_for_map_update: true
-    require_balanced_walls: true
-    min_wall_samples_strict: 12
-    min_wall_balance_ratio: 0.65
+    # -1 means the lower axial slice is the entrance end-cap.
+    # If pipe_s starts from the wrong end, change this to +1.
+    endcap_entry_side: -1
 
-    publish_filter_enable: true
-    publish_cross_section_margin: 0.008
-    publish_wall_snap_tol: 0.010
-    publish_mid_section_keep_ratio: 0.30
+    # Set to measured pipe length if known. Keep -1 to learn exit from first stable observation.
+    endcap_known_length: -1.0
+    endcap_exit_learn_min_s: 0.80
