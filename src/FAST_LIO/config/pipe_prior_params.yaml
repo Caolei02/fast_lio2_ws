@@ -1,66 +1,169 @@
 pipe_prior:
-    enable: true
-    debug_log: true
-    debug_match_stats: true
+  enable: true
+  debug_log: true
+  debug_match_stats: false
+  debug_publish_endcap_points: true
 
-    # Front-end point-to-plane gates
-    plane_score_gate: 0.75
-    plane_abs_pd2_gate: 0.05
+  # Keep the original FAST-LIO point-to-plane update as the main odometry source.
+  geometry_prior_enable: false
 
-    # Keep pipe priors off first; validate end-cap detection and fallback first
-    weight_box: 0.0
-    weight_axis_align: 0.0
-    weight_motion: 0.0
+  # LIO matching protection.
+  plane_score_gate: 0.70
+  plane_abs_pd2_gate: 0.05
+  map_filter_by_residual: true
+  map_use_selected_points: true
+  map_max_pd2: 0.04
+  map_filter_min_eff: 20
+  apply_incidence_filter_in_lio: false
+  min_incidence_cos: 0.20
+  enable_intensity_trim: false
 
-    # Pipe size range, m
-    min_width: 0.20
-    max_width: 0.73
-    min_height: 0.20
-    max_height: 0.73
-    axis_conf_threshold: 0.35
+  # The dimensions seen in your logs are around W=0.17 m and H=0.21 m.
+  # The old 0.25 m lower bound would reject all valid samples.
+  weight_box: 0.0
+  weight_axis_align: 0.0
+  weight_motion: 0.0
+  min_width: 0.08
+  max_width: 0.40
+  min_height: 0.08
+  max_height: 0.40
+  axis_conf_threshold: 0.35
+  degenerate_min_eig: 0.0001
+  degenerate_ratio: 0.20
+  degenerate_cond_thresh: 150.0
+  degenerate_min_pos_rel: 0.10
+  degenerate_hold_frames: 3
+  mid_section_keep_ratio: 0.75
 
-    # Degeneracy diagnostics
-    degenerate_min_eig: 0.05
-    degenerate_ratio: 0.20
-    degenerate_cond_thresh: 200.0
-    degenerate_min_pos_rel: 0.08
-    degenerate_hold_frames: 2
+  # Unknown-length pipe mode.
+  # endcap_known_length <= 0 means do not compute position as L_known - d_exit.
+  endcap_known_length: 0.0
+  position_output_mode: 2
+  initial_lidar_s: 0.0
+  scan_exit_distance_enable: true
+  position_axis_lidar_x: 1.0
+  position_axis_lidar_y: 0.0
+  position_axis_lidar_z: 0.0
+  length_estimate_enable: true
+  length_update_alpha: 0.05
+  length_update_gate: 0.20
+  length_max: 20.0
 
-    # Incidence and intensity filtering
-    min_incidence_cos: 0.30
-    apply_incidence_filter_in_lio: false
-    enable_intensity_trim: true
-    intensity_quantile_low: 0.10
-    intensity_quantile_high: 0.90
-    debug_print_filter_stats: false
-    mid_section_keep_ratio: 0.50
+  # Exit end-cap detection and EKF rows.
+  endcap_enable: true
+  endcap_init_origin: false
+  endcap_use_prior: true
+  endcap_learn_exit: false
+  endcap_entry_side: -1
+  exit_only_mode: true
+  exit_only_front_side: false
+  exit_min_forward_dist: 0.05
+  exit_max_forward_dist: 20.0
 
-    # Conservative map update baseline
-    map_filter_by_residual: true
-    map_use_selected_points: true
-    map_max_pd2: 0.04
+  endcap_min_points: 12
+  endcap_max_prior_points: 40
+  endcap_axis_cos_thresh: 0.85
+  endcap_max_plane_res: 0.04
+  endcap_slice_ratio: 0.25
+  endcap_slice_min: 0.10
+  endcap_min_cross_span: 0.04
+  endcap_require_2d_span: true
 
-    # Entrance/exit end-cap landmark
-    endcap_enable: true
-    endcap_init_origin: true
-    endcap_use_prior: true
-    endcap_fallback_enable: true
-    endcap_learn_exit: true
-    endcap_weight: 0.8
-    endcap_min_points: 25
-    endcap_max_prior_points: 80
-    endcap_axis_cos_thresh: 0.85
-    endcap_max_plane_res: 0.03
-    endcap_slice_ratio: 0.18
-    endcap_slice_min: 0.06
-    endcap_min_cross_span: 0.08
-    endcap_anchor_gate: 0.35
-    endcap_fallback_gate: 0.60
+  endcap_require_lio_healthy: true
+  endcap_min_lio_eff: 30
+  exit_lock_min_frames: 3
+  exit_lock_center_gate: 0.12
+  exit_lock_normal_cos: 0.90
+  exit_prior_requires_lock: true
+  exit_fallback_requires_lock: true
+  # Three-layer outlet-endcap strategy.
+  # Layer 1: normal gate uses endcap_weight.
+  # Layer 2: recovery gate keeps the old outlet anchor and adds weak clipped rows.
+  # Layer 3: outside recovery gate marks the anchor as suspect; auto-relock is disabled by default.
+  endcap_anchor_gate: 0.12
+  endcap_recovery_enable: true
+  endcap_recovery_gate: 0.80
+  endcap_recovery_weight: 0.05
+  endcap_recovery_residual_clip: 0.12
+  endcap_recovery_min_points: 30
+  endcap_recovery_max_plane_res: 0.05
+  exit_relock_enable: false
+  exit_anchor_suspect_min_frames: 10
+  endcap_exit_learn_min_s: 0.50
+  endcap_weight: 0.20
 
-    # -1 means the lower axial slice is the entrance end-cap.
-    # If pipe_s starts from the wrong end, change this to +1.
-    endcap_entry_side: -1
+  exit_locked_plane_prior_enable: false
+  exit_prior_point_gate: 0.05
+  exit_prior_min_points: 4
+  endcap_fallback_enable: false
+  endcap_fallback_gate: 0.25
 
-    # Set to measured pipe length if known. Keep -1 to learn exit from first stable observation.
-    endcap_known_length: -1.0
-    endcap_exit_learn_min_s: 0.80
+  # Robot self mask. Keep off first. Turn on only after checking body points in /cloud_registered_body.
+  self_mask_enable: false
+  self_mask_x_min: -0.70
+  self_mask_x_max: -0.05
+  self_mask_y_min: -0.18
+  self_mask_y_max: 0.18
+  self_mask_z_min: -0.15
+  self_mask_z_max: 0.15
+
+  # Width/height quantification for wall-following motion.
+  # Do not use full point-cloud span or fixed LiDAR-to-bottom height.
+  # Width and height are updated independently, but each dimension requires its
+  # true opposite wall pair. Missing pairs keep the last stable value.
+  size_stabilize_enable: true
+  size_exclude_endcap_points: false
+  size_endcap_exclusion: 0.15
+  size_update_s_min_ratio: 0.05
+  size_update_s_max_ratio: 0.95
+  size_window: 10
+  size_min_stable_samples: 3
+  # 0 disables stable-size jump rejection. This prevents early stable values
+  # from blocking later valid width/height observations.
+  size_jump_gate: 0.0
+  # Use a 10-frame sliding median for final width/height output.
+  size_average_mode: median
+  # Public size output is simplified. /pipe_size only publishes current-frame
+  # width and height after constraints. It does not publish stable, cached or length values.
+  size_publish_stable: false
+  size_publish_fallback_to_stable: false
+  size_require_anchor: false
+  size_use_gravity_height: true
+  size_wall_history_enable: true
+  size_accept_partial_pairs: true
+  # false means a valid width/height observation can enter the stable estimator
+  # even when the full pipe axis is not reliable in that frame.
+  size_update_requires_axis: false
+  # false means the axial ratio update zone will not block stable-size learning.
+  # This is important when the length anchor is not stable yet.
+  size_update_zone_enable: false
+  size_accept_span_fallback: false
+
+  # Conservative pair-wall size policy.
+  # Width updates only when both left/right walls are reliable.
+  # Height updates only when both top/bottom walls are reliable.
+  # If a pair is missing, keep the previous stable value instead of updating.
+  width_require_both_side_walls: true
+  height_require_both_top_bottom_walls: true
+  width_hold_last_valid: true
+  height_hold_last_valid: true
+  height_from_top_with_bottom_prior: false
+  use_fixed_lidar_to_bottom_height: false
+  size_wall_min_side_samples: 3
+  size_min_axis_points: 10
+  size_wall_center_q_low: 0.15
+  size_wall_center_q_high: 0.85
+  size_span_q_low: 0.03
+  size_span_q_high: 0.97
+  size_wall_min_normal_cos: 0.25
+
+  # Robot pose output relative to the first valid algorithm pose.
+  # At the first successful FAST-LIO update, the current body pose is stored as
+  # the origin. /robot_pose_origin then publishes the body pose in this origin
+  # frame for every frame. /robot_path_origin gives the corresponding path.
+  robot_pose_origin_enable: true
+  robot_pose_origin_publish_tf: true
+  robot_pose_origin_path_enable: true
+  robot_pose_origin_path_stride: 10
+  robot_pose_origin_frame: robot_origin
+  robot_pose_origin_child_frame: body_in_robot_origin

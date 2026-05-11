@@ -37,8 +37,11 @@
 #include <math.h>
 #include <thread>
 #include <fstream>
+#include <iomanip>
 #include <csignal>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <Python.h>
 #include <so3_math.h>
 #include <ros/ros.h>
@@ -46,6 +49,7 @@
 #include <Eigen/Eigenvalues>
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <limits>
 #include <Eigen/Geometry>
 #include "IMU_Processing.hpp"
@@ -114,6 +118,7 @@ PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_body(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_down_world(new PointCloudXYZI());
+PointCloudXYZI::Ptr pipe_debug_endcap_world(new PointCloudXYZI());
 PointCloudXYZI::Ptr normvec(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr laserCloudOri(new PointCloudXYZI(100000, 1));
 PointCloudXYZI::Ptr corr_normvect(new PointCloudXYZI(100000, 1));
@@ -141,6 +146,22 @@ nav_msgs::Path path;
 nav_msgs::Odometry odomAftMapped;
 geometry_msgs::Quaternion geoQuat;
 geometry_msgs::PoseStamped msg_body_pose;
+
+// Robot pose output with the first valid algorithm pose as origin.
+bool robot_pose_origin_enable = true;
+bool robot_pose_origin_publish_tf = true;
+bool robot_pose_origin_path_enable = true;
+int  robot_pose_origin_path_stride = 10;
+std::string robot_pose_origin_frame = "robot_origin";
+std::string robot_pose_origin_child_frame = "body_in_robot_origin";
+M3D robot_origin_R_w = Eye3d;
+V3D robot_origin_t_w = Zero3d;
+double robot_origin_time = 0.0;
+bool robot_origin_inited = false;
+nav_msgs::Odometry robotOdomOrigin;
+nav_msgs::Path robotPathOrigin;
+geometry_msgs::PoseStamped robotPoseOriginStamped;
+ofstream robot_pose_csv_log;
 
 shared_ptr<Preprocess> p_pre(new Preprocess());
 shared_ptr<ImuProcess> p_imu(new ImuProcess());
@@ -199,12 +220,18 @@ RectPipeGeomState g_pipe_geom;
 bool   pipe_prior_enable = true;
 bool   pipe_debug_log = false;
 bool   pipe_degenerate = false;
+bool   pipe_geometry_prior_enable = false;
+bool   pipe_endcap_require_lio_healthy = true;
+int    pipe_endcap_min_lio_eff = 30;
+bool   pipe_endcap_require_2d_span = true;
+double pipe_exit_max_forward_dist = 1.50;
+int    pipe_map_filter_min_eff = 20;
 double pipe_prior_weight = 8.0;
 double pipe_axis_align_weight = 3.0;
 double pipe_motion_weight = 1.5;
-double pipe_min_width = 0.25;
+double pipe_min_width = 0.06;
 double pipe_max_width = 1.00;
-double pipe_min_height = 0.25;
+double pipe_min_height = 0.06;
 double pipe_max_height = 1.00;
 double pipe_axis_conf_threshold = 0.35;
 double pipe_degenerate_min_eig = 1e-4;
@@ -253,10 +280,10 @@ V3D    pipe_global_axis_w = V3D(1.0, 0.0, 0.0);
 
 PipeEndCapState g_endcap;
 bool   pipe_endcap_enable = true;
-bool   pipe_endcap_init_origin = true;
+bool   pipe_endcap_init_origin = false;
 bool   pipe_endcap_use_prior = true;
 bool   pipe_endcap_learn_exit = true;
-double pipe_endcap_weight = 2.0;
+double pipe_endcap_weight = 0.2;
 int    pipe_endcap_min_points = 25;
 int    pipe_endcap_max_prior_points = 80;
 double pipe_endcap_axis_cos_thresh = 0.85;
@@ -267,9 +294,55 @@ double pipe_endcap_min_cross_span = 0.08;
 double pipe_endcap_anchor_gate = 0.35;
 double pipe_endcap_exit_learn_min_s = 0.80;
 double pipe_endcap_known_length = -1.0;
-bool   pipe_endcap_fallback_enable = true;
+bool   pipe_endcap_fallback_enable = false;
 double pipe_endcap_fallback_gate = 0.60;
-int    pipe_endcap_entry_side = -1;  // -1: lower axial slice is entrance, +1: higher axial slice is entrance
+int    pipe_endcap_entry_side = -1;  // legacy only, ignored when exit-only mode is enabled
+
+// Exit-only mode. Entrance end-cap is ignored to avoid false positives from the rear body of a dual-body robot.
+bool   pipe_exit_only_mode = true;
+bool   pipe_exit_only_front_side = true;
+double pipe_exit_min_forward_dist = 0.20;
+int    pipe_exit_lock_min_frames = 5;
+double pipe_exit_lock_center_gate = 0.10;
+double pipe_exit_lock_normal_cos = 0.95;
+bool   pipe_exit_prior_requires_lock = true;
+bool   pipe_exit_fallback_requires_lock = true;
+int    pipe_exit_candidate_frames = 0;
+V3D    pipe_exit_candidate_center_w = Zero3d;
+V3D    pipe_exit_candidate_normal_w = V3D(1.0, 0.0, 0.0);
+bool   pipe_exit_candidate_valid = false;
+double pipe_last_distance_to_exit = 0.0;
+bool   pipe_last_pipe_s_valid = false;
+
+// After the outlet landmark is locked, the current frame does not need to
+// redetect a complete outlet plane every time.  Instead, points that lie close
+// to the fixed outlet plane can be collected and used as weak EKF constraints.
+bool   pipe_exit_locked_plane_prior_enable = true;
+double pipe_exit_prior_point_gate = 0.05;
+int    pipe_exit_prior_min_points = 6;
+int    pipe_last_exit_locked_plane_points = 0;
+
+// LiDAR-frame self body mask. Points inside this box are considered robot body points
+// and are excluded from entrance/exit end-cap detection.
+bool   pipe_self_mask_enable = false;
+double pipe_self_mask_x_min = -0.70;
+double pipe_self_mask_x_max = -0.05;
+double pipe_self_mask_y_min = -0.18;
+double pipe_self_mask_y_max =  0.18;
+double pipe_self_mask_z_min = -0.15;
+double pipe_self_mask_z_max =  0.15;
+int    pipe_last_self_mask_reject_count = 0;
+int    pipe_last_endcap_candidate_count = 0;
+int    pipe_last_endcap_prior_rows = 0;
+int    pipe_last_endcap_fallback_rows = 0;
+bool   pipe_last_endcap_fallback_used = false;
+bool   pipe_last_endcap_matched = false;
+int    pipe_last_endcap_unmatched_reject = 0;
+int    pipe_last_endcap_lock_reject = 0;
+int    pipe_last_endcap_gate_reject = 0;
+int    pipe_last_endcap_invalid_reject = 0;
+int    pipe_last_endcap_reject_code = 0;  // 0 ok, 1 invalid, 2 unmatched, 3 bad weight/cols, 4 wrong anchor, 5 lock missing, 6 no rows after gate
+bool   pipe_debug_publish_endcap_points = true;
 bool   pipe_origin_initialized = false;
 bool   pipe_start_cap_initialized = false;
 bool   pipe_exit_cap_initialized = false;
@@ -281,7 +354,140 @@ double pipe_start_cap_d = 0.0;
 double pipe_exit_cap_d = 0.0;
 double pipe_last_pipe_s = 0.0;
 
+// Axial position output for known and unknown pipe length.
+// The odom quantity is the LiDAR center axial displacement from the initial frame.
+// The scan quantity is the current LiDAR-to-exit distance measured directly in the LiDAR frame.
+int    pipe_position_output_mode = 2;  // 0: legacy locked-exit world anchor, 1: scan distance when known length, 2: odom + online length estimate
+double pipe_initial_lidar_s = 0.0;
+bool   pipe_scan_exit_distance_enable = true;
+double pipe_position_axis_lidar_x = 1.0;
+double pipe_position_axis_lidar_y = 0.0;
+double pipe_position_axis_lidar_z = 0.0;
+bool   pipe_axis_odom_initialized = false;
+V3D    pipe_lidar_pos0_w = Zero3d;
+V3D    pipe_axis0_w = V3D(1.0, 0.0, 0.0);
+bool   pipe_last_s_odom_valid = false;
+double pipe_last_s_odom = 0.0;
+bool   pipe_last_d_exit_scan_valid = false;
+double pipe_last_d_exit_scan = 0.0;
+double pipe_last_scan_plane_res = 0.0;
+bool   pipe_length_estimate_enable = true;
+bool   pipe_length_est_valid = false;
+double pipe_length_est = 0.0;
+double pipe_last_length_meas = 0.0;
+int    pipe_length_est_samples = 0;
+double pipe_length_update_alpha = 0.05;
+double pipe_length_update_gate = 0.20;
+double pipe_length_max = 20.0;
+double pipe_last_pipe_length_output = 0.0;
+
+// Stable pipe size estimation.
+// Entrance/exit end-cap points can pollute single-frame W/H in short sealed pipes.
+bool   pipe_size_stabilize_enable = true;
+bool   pipe_size_exclude_endcap_points = false;
+double pipe_size_endcap_exclusion = 0.15;
+double pipe_size_update_s_min_ratio = 0.20;
+double pipe_size_update_s_max_ratio = 0.70;
+int    pipe_size_window = 10;
+int    pipe_size_min_stable_samples = 5;
+double pipe_size_jump_gate = 0.08;
+std::string pipe_size_average_mode = "median"; // mean, median, trimmed_mean
+double pipe_size_trim_ratio = 0.10;
+bool   pipe_size_require_anchor = true;
+bool   pipe_size_use_gravity_height = true;
+bool   pipe_size_wall_history_enable = true;
+int    pipe_size_wall_min_side_samples = 5;
+int    pipe_size_min_axis_points = 20;
+double pipe_size_wall_center_q_low = 0.15;
+double pipe_size_wall_center_q_high = 0.85;
+double pipe_size_span_q_low = 0.03;
+double pipe_size_span_q_high = 0.97;
+double pipe_size_wall_min_normal_cos = 0.35;
+bool   pipe_size_accept_partial_pairs = true;
+// If false, size samples can update the stable estimator even when the current
+// frame is not reliable enough for a full pipe-axis observation. This avoids
+// blocking valid W/H samples in degenerate straight-pipe frames.
+bool   pipe_size_update_requires_axis = false;
+// If false, valid size samples are not blocked by the axial update-zone gate.
+// End-cap exclusion still removes points close to the outlet/entry face.
+bool   pipe_size_update_zone_enable = false;
+// Conservative size quantification: no full-span fallback. Width updates only
+// from left/right wall pairs; height updates only from top/bottom wall pairs.
+bool   pipe_size_accept_span_fallback = false;
+// Publish policy for /pipe_size. When false, /pipe_size reports the current-frame
+// raw W/H observation and does not reuse stable dimensions. Stable W/H are still
+// maintained internally and written to CSV for debugging.
+bool   pipe_size_publish_stable = false;
+bool   pipe_size_publish_fallback_to_stable = false;
+bool   pipe_width_require_both_side_walls = true;
+bool   pipe_height_require_both_top_bottom_walls = true;
+bool   pipe_width_hold_last_valid = true;
+bool   pipe_height_hold_last_valid = true;
+double pipe_last_raw_width = 0.0;
+double pipe_last_raw_height = 0.0;
+double pipe_last_anchor_length = -1.0;
+bool   pipe_last_size_update_zone = false;
+bool   pipe_last_size_sample_accepted = false;
+bool   pipe_last_size_endcap_exclusion_used = false;
+bool   pipe_stable_size_valid = false;
+bool   pipe_stable_width_valid = false;
+bool   pipe_stable_height_valid = false;
+double pipe_stable_width = 0.0;
+double pipe_stable_height = 0.0;
+std::deque<double> pipe_width_hist;
+std::deque<double> pipe_height_hist;
+int pipe_last_width_sample_count = 0;
+int pipe_last_height_sample_count = 0;
+int pipe_last_width_hist_n = 0;
+int pipe_last_height_hist_n = 0;
+bool pipe_last_width_sample_accepted = false;
+bool pipe_last_height_sample_accepted = false;
+bool pipe_last_width_hold = false;
+bool pipe_last_height_hold = false;
+double pipe_last_width_sample = 0.0;
+double pipe_last_height_sample = 0.0;
+
+// Current-frame geometry observation for logging and size debugging.
+// g_pipe_geom is allowed to keep the last usable axis for end-cap detection,
+// so it must not be used as the per-frame measurement in CSV/log output.
+bool   pipe_last_geom_updated = false;
+int    pipe_last_geom_fail_code = 0;
+bool   pipe_last_frame_valid = false;
+bool   pipe_last_frame_axis_reliable = false;
+bool   pipe_last_frame_box_reliable = false;
+double pipe_last_frame_length = 0.0;
+double pipe_last_frame_width = 0.0;
+double pipe_last_frame_height = 0.0;
+double pipe_last_frame_global_length = 0.0;
+double pipe_last_frame_conf = 0.0;
+int    pipe_last_frame_u_pos_count = 0;
+int    pipe_last_frame_u_neg_count = 0;
+int    pipe_last_frame_v_pos_count = 0;
+int    pipe_last_frame_v_neg_count = 0;
+bool   pipe_last_frame_four_wall_fit_ok = false;
+
+// Simplified public pipe-size output. Only current-frame width and height
+// after configured constraints are exposed. Other size variants remain internal.
+bool   pipe_last_constrained_size_valid = false;
+double pipe_last_constrained_width = 0.0;
+double pipe_last_constrained_height = 0.0;
+int    pipe_last_constrained_width_pair_count = 0;
+int    pipe_last_constrained_height_pair_count = 0;
+
 ofstream pipe_csv_log;
+
+static void ensure_log_directory_exists(const string &root_dir)
+{
+    string log_dir = root_dir + "/Log";
+    struct stat st;
+    if (stat(log_dir.c_str(), &st) != 0)
+    {
+        if (mkdir(log_dir.c_str(), 0755) != 0)
+        {
+            ROS_WARN_STREAM("[LOG] failed to create log directory: " << log_dir);
+        }
+    }
+}
 
 void init_pipe_csv_log(const string &csv_path)
 {
@@ -294,7 +500,7 @@ void init_pipe_csv_log(const string &csv_path)
         return;
     }
 
-    pipe_csv_log << "stamp_abs,stamp_rel,valid,deg,eig_min,cond,axial,lateral,axial_ratio,min_pos_rel,u_info,v_info,deg_abs,deg_rel,deg_axis,deg_cond,local_length,width,height,global_length,conf,u_pos_count,u_neg_count,v_pos_count,v_neg_count,four_wall_fit_ok,geom_raw_count,geom_filtered_count,intensity_trim_used,axis_reliable,box_reliable,endcap_visible,endcap_reliable,endcap_anchor,endcap_points,endcap_s,endcap_s_anchor,endcap_res,pipe_s\n";
+    pipe_csv_log << "stamp_abs,stamp_rel,size_valid,width,height,width_pair_count,height_pair_count,axis_reliable,geom_updated,geom_fail_code,pipe_s,s_odom,d_exit_scan,scan_valid,length_est,length_valid,robot_pose_valid,robot_x,robot_y,robot_z,robot_qx,robot_qy,robot_qz,robot_qw,robot_roll,robot_pitch,robot_yaw,robot_vx,robot_vy,robot_vz\n";
     pipe_csv_log.flush();
 }
 
@@ -302,46 +508,52 @@ inline void append_pipe_csv_log(double stamp_abs, double stamp_rel)
 {
     if (!pipe_csv_log.is_open()) return;
 
+    bool robot_pose_valid = robot_pose_origin_enable && robot_origin_inited;
+    double robot_roll = 0.0, robot_pitch = 0.0, robot_yaw = 0.0;
+    if (robot_pose_valid)
+    {
+        Eigen::Quaterniond q_pipe(robotOdomOrigin.pose.pose.orientation.w,
+                                  robotOdomOrigin.pose.pose.orientation.x,
+                                  robotOdomOrigin.pose.pose.orientation.y,
+                                  robotOdomOrigin.pose.pose.orientation.z);
+        q_pipe.normalize();
+        V3D eul_pipe = q_pipe.toRotationMatrix().eulerAngles(0, 1, 2);
+        robot_roll = eul_pipe(0);
+        robot_pitch = eul_pipe(1);
+        robot_yaw = eul_pipe(2);
+    }
+
     pipe_csv_log << fixed << setprecision(9)
                  << stamp_abs << ","
                  << stamp_rel << ","
-                 << int(g_pipe_geom.valid) << ","
-                 << int(pipe_degenerate) << ","
-                 << pipe_last_min_eig << ","
-                 << pipe_last_cond_num << ","
-                 << pipe_last_axial_info << ","
-                 << pipe_last_lateral_info << ","
-                 << pipe_last_axial_ratio << ","
-                 << pipe_last_min_pos_rel << ","
-                 << pipe_last_u_info << ","
-                 << pipe_last_v_info << ","
-                 << int(pipe_last_deg_by_abs_eig) << ","
-                 << int(pipe_last_deg_by_rel_eig) << ","
-                 << int(pipe_last_deg_by_axial_ratio) << ","
-                 << int(pipe_last_deg_by_cond) << ","
-                 << g_pipe_geom.length << ","
-                 << g_pipe_geom.width << ","
-                 << g_pipe_geom.height << ","
-                 << g_pipe_geom.global_length << ","
-                 << g_pipe_geom.straight_confidence << ","
-                 << g_pipe_geom.u_pos_count << ","
-                 << g_pipe_geom.u_neg_count << ","
-                 << g_pipe_geom.v_pos_count << ","
-                 << g_pipe_geom.v_neg_count << ","
-                 << int(g_pipe_geom.four_wall_fit_ok) << ","
-                 << pipe_last_geom_raw_count << ","
-                 << pipe_last_geom_filtered_count << ","
-                 << int(pipe_last_geom_used_intensity_trim) << ","
-                 << int(g_pipe_geom.axis_reliable) << ","
-                 << int(g_pipe_geom.box_reliable) << ","
-                 << int(g_endcap.visible) << ","
-                 << int(g_endcap.reliable) << ","
-                 << g_endcap.anchor_id << ","
-                 << g_endcap.point_count << ","
-                 << g_endcap.s_meas << ","
-                 << g_endcap.s_anchor << ","
-                 << g_endcap.mean_abs_res << ","
-                 << pipe_last_pipe_s << "\n";
+                 << int(pipe_last_constrained_size_valid) << ","
+                 << pipe_last_constrained_width << ","
+                 << pipe_last_constrained_height << ","
+                 << pipe_last_constrained_width_pair_count << ","
+                 << pipe_last_constrained_height_pair_count << ","
+                 << int(pipe_last_frame_axis_reliable) << ","
+                 << int(pipe_last_geom_updated) << ","
+                 << pipe_last_geom_fail_code << ","
+                 << pipe_last_pipe_s << ","
+                 << pipe_last_s_odom << ","
+                 << pipe_last_d_exit_scan << ","
+                 << int(pipe_last_d_exit_scan_valid) << ","
+                 << pipe_length_est << ","
+                 << int(pipe_length_est_valid) << ","
+                 << int(robot_pose_valid) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.position.x : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.position.y : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.position.z : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.orientation.x : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.orientation.y : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.orientation.z : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.pose.pose.orientation.w : 1.0) << ","
+                 << robot_roll << ","
+                 << robot_pitch << ","
+                 << robot_yaw << ","
+                 << (robot_pose_valid ? robotOdomOrigin.twist.twist.linear.x : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.twist.twist.linear.y : 0.0) << ","
+                 << (robot_pose_valid ? robotOdomOrigin.twist.twist.linear.z : 0.0) << "\n";
     pipe_csv_log.flush();
 }
 
@@ -652,7 +864,12 @@ void map_incremental()
          * and whose final absolute plane residual is small enough. This prevents
          * a loose score gate from polluting the local map with thick walls or ghost points.
          */
-        if (pipe_prior_enable && pipe_map_filter_by_residual && flg_EKF_inited)
+        // Keep the original FAST-LIO map update alive when the current frame has
+        // too few accepted point-to-plane rows. If we keep filtering the map by the
+        // previous matcher result after effct_feat_num collapses, the ikd-tree can
+        // stop growing and the system cannot recover.
+        bool lio_match_healthy_for_map = (effct_feat_num >= std::max(1, pipe_map_filter_min_eff));
+        if (pipe_prior_enable && pipe_map_filter_by_residual && flg_EKF_inited && lio_match_healthy_for_map)
         {
             if (pipe_map_use_selected_points && !point_selected_surf[i])
             {
@@ -702,6 +919,8 @@ void map_incremental()
     if ((pipe_debug_match_stats || pipe_debug_log) && pipe_prior_enable && pipe_map_filter_by_residual && flg_EKF_inited)
     {
         ROS_WARN_STREAM_THROTTLE(1.0, "[DBG_MAP_FILTER] feats_down_size=" << feats_down_size
+                                 << " eff=" << effct_feat_num
+                                 << " healthy=" << int(effct_feat_num >= std::max(1, pipe_map_filter_min_eff))
                                  << " candidates=" << map_candidates
                                  << " skip_unselected=" << map_skip_unselected
                                  << " skip_residual=" << map_skip_residual
@@ -867,6 +1086,144 @@ void publish_odometry(const ros::Publisher & pubOdomAftMapped)
     br.sendTransform( tf::StampedTransform( transform, odomAftMapped.header.stamp, "camera_init", "body" ) );
 }
 
+void init_robot_origin_pose_if_needed()
+{
+    if (robot_origin_inited) return;
+
+    robot_origin_R_w = state_point.rot.toRotationMatrix();
+    robot_origin_t_w = state_point.pos;
+    robot_origin_time = lidar_end_time;
+    robot_origin_inited = true;
+
+    robotPathOrigin.header.frame_id = robot_pose_origin_frame;
+    robotPathOrigin.poses.clear();
+
+    ROS_WARN_STREAM("[ROBOT POSE] origin initialized at t=" << robot_origin_time
+                    << " pos=[" << robot_origin_t_w(0) << ","
+                    << robot_origin_t_w(1) << "," << robot_origin_t_w(2) << "]");
+}
+
+bool compute_robot_pose_in_origin(V3D &p_rel, M3D &R_rel, V3D &v_rel)
+{
+    if (!robot_pose_origin_enable) return false;
+    init_robot_origin_pose_if_needed();
+    if (!robot_origin_inited) return false;
+
+    M3D R0_inv = robot_origin_R_w.transpose();
+    p_rel = R0_inv * (state_point.pos - robot_origin_t_w);
+    R_rel = R0_inv * state_point.rot.toRotationMatrix();
+    v_rel = R0_inv * state_point.vel;
+    return true;
+}
+
+bool fill_robot_origin_odometry(nav_msgs::Odometry &odom)
+{
+    V3D p_rel = Zero3d, v_rel = Zero3d;
+    M3D R_rel = Eye3d;
+    if (!compute_robot_pose_in_origin(p_rel, R_rel, v_rel)) return false;
+
+    Eigen::Quaterniond q_rel(R_rel);
+    q_rel.normalize();
+
+    odom.header.frame_id = robot_pose_origin_frame;
+    odom.child_frame_id = robot_pose_origin_child_frame;
+    odom.header.stamp = ros::Time().fromSec(lidar_end_time);
+
+    odom.pose.pose.position.x = p_rel(0);
+    odom.pose.pose.position.y = p_rel(1);
+    odom.pose.pose.position.z = p_rel(2);
+    odom.pose.pose.orientation.x = q_rel.x();
+    odom.pose.pose.orientation.y = q_rel.y();
+    odom.pose.pose.orientation.z = q_rel.z();
+    odom.pose.pose.orientation.w = q_rel.w();
+
+    for (int i = 0; i < 36; ++i) odom.pose.covariance[i] = odomAftMapped.pose.covariance[i];
+    for (int i = 0; i < 36; ++i) odom.twist.covariance[i] = 0.0;
+
+    odom.twist.twist.linear.x = v_rel(0);
+    odom.twist.twist.linear.y = v_rel(1);
+    odom.twist.twist.linear.z = v_rel(2);
+    return true;
+}
+
+void append_robot_pose_origin_csv(const nav_msgs::Odometry &odom)
+{
+    if (!robot_pose_csv_log.is_open()) return;
+
+    Eigen::Quaterniond q_csv(odom.pose.pose.orientation.w,
+                             odom.pose.pose.orientation.x,
+                             odom.pose.pose.orientation.y,
+                             odom.pose.pose.orientation.z);
+    q_csv.normalize();
+    V3D eul_rel = q_csv.toRotationMatrix().eulerAngles(0, 1, 2);
+    robot_pose_csv_log << std::fixed << std::setprecision(9)
+                       << lidar_end_time << ","
+                       << (lidar_end_time - robot_origin_time) << ","
+                       << odom.pose.pose.position.x << ","
+                       << odom.pose.pose.position.y << ","
+                       << odom.pose.pose.position.z << ","
+                       << odom.pose.pose.orientation.x << ","
+                       << odom.pose.pose.orientation.y << ","
+                       << odom.pose.pose.orientation.z << ","
+                       << odom.pose.pose.orientation.w << ","
+                       << eul_rel(0) << ","
+                       << eul_rel(1) << ","
+                       << eul_rel(2) << ","
+                       << odom.twist.twist.linear.x << ","
+                       << odom.twist.twist.linear.y << ","
+                       << odom.twist.twist.linear.z << "\n";
+    robot_pose_csv_log.flush();
+}
+
+void publish_robot_pose_origin(const ros::Publisher &pubRobotOdomOrigin,
+                               const ros::Publisher &pubRobotPathOrigin)
+{
+    if (!robot_pose_origin_enable) return;
+
+    if (!fill_robot_origin_odometry(robotOdomOrigin)) return;
+    pubRobotOdomOrigin.publish(robotOdomOrigin);
+    ROS_INFO_STREAM_THROTTLE(1.0, "[ROBOT POSE] origin pose x="
+                             << robotOdomOrigin.pose.pose.position.x
+                             << " y=" << robotOdomOrigin.pose.pose.position.y
+                             << " z=" << robotOdomOrigin.pose.pose.position.z);
+
+    if (robot_pose_origin_publish_tf)
+    {
+        static tf::TransformBroadcaster br_origin;
+        tf::Transform transform;
+        tf::Quaternion q;
+        transform.setOrigin(tf::Vector3(robotOdomOrigin.pose.pose.position.x,
+                                        robotOdomOrigin.pose.pose.position.y,
+                                        robotOdomOrigin.pose.pose.position.z));
+        q.setX(robotOdomOrigin.pose.pose.orientation.x);
+        q.setY(robotOdomOrigin.pose.pose.orientation.y);
+        q.setZ(robotOdomOrigin.pose.pose.orientation.z);
+        q.setW(robotOdomOrigin.pose.pose.orientation.w);
+        transform.setRotation(q);
+        br_origin.sendTransform(tf::StampedTransform(transform,
+                                robotOdomOrigin.header.stamp,
+                                robot_pose_origin_frame,
+                                robot_pose_origin_child_frame));
+    }
+
+    if (robot_pose_origin_path_enable)
+    {
+        static int path_counter = 0;
+        path_counter++;
+        int stride = std::max(1, robot_pose_origin_path_stride);
+        if (path_counter % stride == 0)
+        {
+            robotPoseOriginStamped.header = robotOdomOrigin.header;
+            robotPoseOriginStamped.pose = robotOdomOrigin.pose.pose;
+            robotPathOrigin.header = robotOdomOrigin.header;
+            robotPathOrigin.poses.push_back(robotPoseOriginStamped);
+            pubRobotPathOrigin.publish(robotPathOrigin);
+        }
+    }
+
+    append_robot_pose_origin_csv(robotOdomOrigin);
+}
+
 
 inline V3D pointBodyToWorldVec(const V3D &pi, const state_ikfom &s)
 {
@@ -911,6 +1268,332 @@ double robust_trimmed_center(vector<double> vec, double q_low = 0.2, double q_hi
     return sum / double(count);
 }
 
+
+double pipe_effective_pipe_length()
+{
+    if (pipe_endcap_known_length > 0.0)
+        return pipe_endcap_known_length;
+    if (pipe_length_est_valid && pipe_length_est > 1e-6)
+        return pipe_length_est;
+    if (!pipe_exit_only_mode && pipe_origin_initialized && pipe_exit_cap_initialized)
+        return (pipe_exit_cap_center_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+    return -1.0;
+}
+
+double pipe_anchor_length_for_size()
+{
+    double len = pipe_effective_pipe_length();
+    pipe_last_anchor_length = len;
+    return len;
+}
+
+bool pipe_point_near_endcap_for_size(const V3D &p_world)
+{
+    if (!pipe_size_exclude_endcap_points) return false;
+    double margin = std::max(0.0, pipe_size_endcap_exclusion);
+    if (margin <= 1e-6) return false;
+
+    // Exit-only mode does not require a known length. Once the outlet plane is
+    // locked, just remove points close to that plane so the end-cap does not
+    // pollute W/H estimation.
+    if (pipe_exit_only_mode)
+    {
+        if (!pipe_exit_cap_initialized) return false;
+        V3D axis = pipe_axis_anchor_w;
+        if (axis.norm() < 1e-6) return false;
+        axis.normalize();
+        double dist_to_exit_plane = std::fabs((p_world - pipe_exit_cap_center_w).dot(axis));
+        return dist_to_exit_plane < margin;
+    }
+
+    if (!pipe_origin_initialized) return false;
+    double s_val = (p_world - pipe_origin_w).dot(pipe_axis_anchor_w);
+    if (s_val < margin) return true;
+
+    double len = pipe_anchor_length_for_size();
+    if (len > 0.0 && s_val > len - margin) return true;
+    return false;
+}
+
+bool pipe_size_update_zone_ok()
+{
+    if (!pipe_size_stabilize_enable) return true;
+    if (!pipe_size_update_zone_enable)
+    {
+        pipe_last_size_update_zone = true;
+        return true;
+    }
+
+    pipe_last_size_update_zone = false;
+    double len = pipe_anchor_length_for_size();
+
+    if (len <= 1e-6)
+    {
+        pipe_last_size_update_zone = !pipe_size_require_anchor;
+        return pipe_last_size_update_zone;
+    }
+
+    double s_for_zone = pipe_last_pipe_s;
+    if (pipe_last_s_odom_valid)
+        s_for_zone = pipe_last_s_odom;
+
+    bool s_valid = pipe_last_pipe_s_valid || pipe_last_s_odom_valid;
+    if (!s_valid)
+    {
+        pipe_last_size_update_zone = !pipe_size_require_anchor;
+        return pipe_last_size_update_zone;
+    }
+
+    double ratio = s_for_zone / len;
+    double r_min = std::max(0.0, std::min(1.0, pipe_size_update_s_min_ratio));
+    double r_max = std::max(0.0, std::min(1.0, pipe_size_update_s_max_ratio));
+    if (r_max < r_min) std::swap(r_min, r_max);
+    pipe_last_size_update_zone = (ratio >= r_min && ratio <= r_max);
+    return pipe_last_size_update_zone;
+}
+
+double pipe_median_from_deque(const std::deque<double> &dq)
+{
+    if (dq.empty()) return 0.0;
+    vector<double> tmp(dq.begin(), dq.end());
+    return quantile_from_sorted(tmp, 0.5);
+}
+
+double pipe_mean_from_deque(const std::deque<double> &dq)
+{
+    if (dq.empty()) return 0.0;
+    double sum = 0.0;
+    for (double v : dq) sum += v;
+    return sum / double(dq.size());
+}
+
+double pipe_trimmed_mean_from_deque(const std::deque<double> &dq, double trim_ratio)
+{
+    if (dq.empty()) return 0.0;
+    vector<double> tmp(dq.begin(), dq.end());
+    std::sort(tmp.begin(), tmp.end());
+
+    double r = std::max(0.0, std::min(0.40, trim_ratio));
+    int n = int(tmp.size());
+    int cut = int(std::floor(r * double(n)));
+    int first = std::min(cut, std::max(0, n - 1));
+    int last = std::max(first + 1, n - cut);
+
+    double sum = 0.0;
+    int cnt = 0;
+    for (int i = first; i < last; ++i)
+    {
+        sum += tmp[i];
+        cnt++;
+    }
+    return cnt > 0 ? sum / double(cnt) : 0.0;
+}
+
+double pipe_size_estimator_from_deque(const std::deque<double> &dq)
+{
+    if (pipe_size_average_mode == "mean") return pipe_mean_from_deque(dq);
+    if (pipe_size_average_mode == "median") return pipe_median_from_deque(dq);
+    return pipe_trimmed_mean_from_deque(dq, pipe_size_trim_ratio);
+}
+
+bool pipe_size_sample_close_to_history(const std::deque<double> &dq, double value, double gate)
+{
+    if (gate <= 1e-6) return true;
+    // Do not reject during warm-up. Otherwise the first few noisy samples can
+    // lock the stable estimator and prevent later valid observations from entering.
+    if (int(dq.size()) < std::max(1, pipe_size_min_stable_samples)) return true;
+
+    double ref = pipe_size_estimator_from_deque(dq);
+    if (!(ref > 0.0)) return true;
+    return std::fabs(value - ref) <= gate;
+}
+
+void pipe_update_stable_size_valid()
+{
+    pipe_last_width_hist_n = int(pipe_width_hist.size());
+    pipe_last_height_hist_n = int(pipe_height_hist.size());
+
+    pipe_stable_width = pipe_size_estimator_from_deque(pipe_width_hist);
+    pipe_stable_height = pipe_size_estimator_from_deque(pipe_height_hist);
+
+    pipe_stable_width_valid = (int(pipe_width_hist.size()) >= std::max(1, pipe_size_min_stable_samples) &&
+                               pipe_stable_width > pipe_min_width && pipe_stable_width < pipe_max_width);
+
+    pipe_stable_height_valid = (int(pipe_height_hist.size()) >= std::max(1, pipe_size_min_stable_samples) &&
+                                pipe_stable_height > pipe_min_height && pipe_stable_height < pipe_max_height);
+
+    pipe_stable_size_valid = pipe_stable_width_valid && pipe_stable_height_valid;
+}
+
+bool pipe_push_stable_width_sample(double width)
+{
+    if (!(width > pipe_min_width && width < pipe_max_width)) return false;
+
+    // Gate against the current history only after enough samples have accumulated.
+    // A non-positive gate disables jump rejection completely.
+    if (!pipe_size_sample_close_to_history(pipe_width_hist, width, pipe_size_jump_gate)) return false;
+
+    pipe_width_hist.push_back(width);
+    int win = pipe_size_window;
+    if (win > 0)
+    {
+        while (int(pipe_width_hist.size()) > win) pipe_width_hist.pop_front();
+    }
+    pipe_update_stable_size_valid();
+    return true;
+}
+
+bool pipe_push_stable_height_sample(double height)
+{
+    if (!(height > pipe_min_height && height < pipe_max_height)) return false;
+
+    if (!pipe_size_sample_close_to_history(pipe_height_hist, height, pipe_size_jump_gate)) return false;
+
+    pipe_height_hist.push_back(height);
+    int win = pipe_size_window;
+    if (win > 0)
+    {
+        while (int(pipe_height_hist.size()) > win) pipe_height_hist.pop_front();
+    }
+    pipe_update_stable_size_valid();
+    return true;
+}
+
+void pipe_push_stable_size_sample(double width, double height)
+{
+    pipe_push_stable_width_sample(width);
+    pipe_push_stable_height_sample(height);
+}
+
+bool pipe_accept_size_sample(double width, double height, bool candidate_box_ok)
+{
+    pipe_last_size_sample_accepted = false;
+    pipe_last_width_sample_accepted = false;
+    pipe_last_height_sample_accepted = false;
+    pipe_last_width_hold = false;
+    pipe_last_height_hold = false;
+    pipe_last_width_sample = width;
+    pipe_last_height_sample = height;
+    pipe_last_width_hist_n = int(pipe_width_hist.size());
+    pipe_last_height_hist_n = int(pipe_height_hist.size());
+    if (!pipe_size_stabilize_enable) return candidate_box_ok;
+    if (!candidate_box_ok) return false;
+    if (!pipe_size_update_zone_ok())
+    {
+        pipe_last_width_hold = pipe_width_hold_last_valid && pipe_stable_width_valid;
+        pipe_last_height_hold = pipe_height_hold_last_valid && pipe_stable_height_valid;
+        pipe_last_width_hist_n = int(pipe_width_hist.size());
+        pipe_last_height_hist_n = int(pipe_height_hist.size());
+        return false;
+    }
+
+    pipe_last_width_sample_accepted = pipe_push_stable_width_sample(width);
+    pipe_last_height_sample_accepted = pipe_push_stable_height_sample(height);
+    pipe_last_size_sample_accepted = pipe_last_width_sample_accepted && pipe_last_height_sample_accepted;
+    return pipe_last_size_sample_accepted;
+}
+
+bool pipe_accept_size_observations(double width, bool width_ok,
+                                   double height, bool height_ok,
+                                   bool axis_ok)
+{
+    pipe_last_size_sample_accepted = false;
+    pipe_last_width_sample_accepted = false;
+    pipe_last_height_sample_accepted = false;
+    pipe_last_width_hold = false;
+    pipe_last_height_hold = false;
+    pipe_last_width_sample = width;
+    pipe_last_height_sample = height;
+    pipe_last_width_hist_n = int(pipe_width_hist.size());
+    pipe_last_height_hist_n = int(pipe_height_hist.size());
+
+    if (!pipe_size_stabilize_enable) return axis_ok && width_ok && height_ok;
+    if (pipe_size_update_requires_axis && !axis_ok) return false;
+    if (!width_ok && !height_ok) return false;
+    if (!pipe_size_update_zone_ok())
+    {
+        pipe_last_width_hold = pipe_width_hold_last_valid && pipe_stable_width_valid;
+        pipe_last_height_hold = pipe_height_hold_last_valid && pipe_stable_height_valid;
+        return false;
+    }
+
+    if (width_ok)
+        pipe_last_width_sample_accepted = pipe_push_stable_width_sample(width);
+    else
+        pipe_last_width_hold = pipe_width_hold_last_valid && pipe_stable_width_valid;
+
+    if (height_ok)
+        pipe_last_height_sample_accepted = pipe_push_stable_height_sample(height);
+    else
+        pipe_last_height_hold = pipe_height_hold_last_valid && pipe_stable_height_valid;
+
+    // Missing either wall pair never invalidates the previous stable dimension.
+    // It simply does not add a new sample for that dimension.
+    pipe_last_size_sample_accepted = pipe_last_width_sample_accepted || pipe_last_height_sample_accepted;
+    return pipe_last_size_sample_accepted;
+}
+
+void pipe_apply_stable_size_to_geom(RectPipeGeomState &geom)
+{
+    if (!pipe_size_stabilize_enable) return;
+
+    // Stable dimensions are publishing priors only. They must not turn a bad
+    // single-frame rectangle into a reliable EKF geometry observation.
+    if (pipe_stable_width_valid)
+    {
+        geom.width = pipe_stable_width;
+        geom.u_min = -0.5 * pipe_stable_width;
+        geom.u_max =  0.5 * pipe_stable_width;
+    }
+
+    if (pipe_stable_height_valid)
+    {
+        geom.height = pipe_stable_height;
+        geom.v_min = -0.5 * pipe_stable_height;
+        geom.v_max =  0.5 * pipe_stable_height;
+    }
+}
+
+void pipe_reset_frame_geom_observation()
+{
+    pipe_last_geom_updated = false;
+    pipe_last_geom_fail_code = 0;
+    pipe_last_frame_valid = false;
+    pipe_last_frame_axis_reliable = false;
+    pipe_last_frame_box_reliable = false;
+    pipe_last_frame_length = 0.0;
+    pipe_last_frame_width = 0.0;
+    pipe_last_frame_height = 0.0;
+    pipe_last_frame_global_length = pipe_global_length;
+    pipe_last_frame_conf = 0.0;
+    pipe_last_frame_u_pos_count = 0;
+    pipe_last_frame_u_neg_count = 0;
+    pipe_last_frame_v_pos_count = 0;
+    pipe_last_frame_v_neg_count = 0;
+    pipe_last_frame_four_wall_fit_ok = false;
+    pipe_last_constrained_size_valid = false;
+    pipe_last_constrained_width = 0.0;
+    pipe_last_constrained_height = 0.0;
+    pipe_last_constrained_width_pair_count = 0;
+    pipe_last_constrained_height_pair_count = 0;
+
+    pipe_last_raw_width = 0.0;
+    pipe_last_raw_height = 0.0;
+    pipe_last_size_sample_accepted = false;
+    pipe_last_width_sample_accepted = false;
+    pipe_last_height_sample_accepted = false;
+    pipe_last_width_sample_count = 0;
+    pipe_last_height_sample_count = 0;
+    pipe_last_width_sample = 0.0;
+    pipe_last_height_sample = 0.0;
+    pipe_last_width_hold = false;
+    pipe_last_height_hold = false;
+    pipe_last_size_update_zone = false;
+    pipe_last_size_endcap_exclusion_used = false;
+    pipe_last_width_hist_n = int(pipe_width_hist.size());
+    pipe_last_height_hist_n = int(pipe_height_hist.size());
+}
+
 bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
 {
     geom.valid = false;
@@ -925,7 +1608,22 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     geom.v_pos_count = 0;
     geom.v_neg_count = 0;
     geom.four_wall_fit_ok = false;
-    if (effct_feat_num < 20) return false;
+    pipe_last_constrained_size_valid = false;
+    pipe_last_constrained_width = 0.0;
+    pipe_last_constrained_height = 0.0;
+    pipe_last_constrained_width_pair_count = 0;
+    pipe_last_constrained_height_pair_count = 0;
+    pipe_last_raw_width = 0.0;
+    pipe_last_raw_height = 0.0;
+    pipe_last_size_sample_accepted = false;
+    pipe_last_width_sample_accepted = false;
+    pipe_last_height_sample_accepted = false;
+    pipe_last_width_sample_count = 0;
+    pipe_last_height_sample_count = 0;
+    pipe_last_size_update_zone = false;
+    pipe_last_size_endcap_exclusion_used = false;
+    pipe_anchor_length_for_size();
+    if (effct_feat_num < 20) { pipe_last_geom_fail_code = 1; return false; }
 
     struct GeomCandidate
     {
@@ -962,6 +1660,12 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
             cand.cos_incidence = std::fabs(ray.dot(n) / ray_norm);
         }
 
+        if (pipe_point_near_endcap_for_size(cand.p_world))
+        {
+            pipe_last_size_endcap_exclusion_used = true;
+            continue;
+        }
+
         if (pipe_apply_incidence_filter_in_lio && cand.cos_incidence < pipe_min_incidence_cos)
             continue;
 
@@ -972,7 +1676,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     pipe_last_geom_filtered_count = pipe_last_geom_raw_count;
     pipe_last_geom_used_intensity_trim = false;
 
-    if (raw_candidates.size() < 20) return false;
+    if (raw_candidates.size() < 20) { pipe_last_geom_fail_code = 2; return false; }
 
     vector<GeomCandidate> geom_candidates = raw_candidates;
     if (pipe_enable_intensity_trim && raw_candidates.size() >= 20)
@@ -1026,7 +1730,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
         centroid += cand.p_world;
     }
 
-    if (world_pts.size() < 20) return false;
+    if (world_pts.size() < 20) { pipe_last_geom_fail_code = 3; return false; }
     centroid /= double(world_pts.size());
 
     M3D normal_cov = M3D::Zero();
@@ -1037,7 +1741,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     normal_cov /= double(normals.size());
 
     Eigen::SelfAdjointEigenSolver<M3D> eig_solver(normal_cov);
-    if (eig_solver.info() != Eigen::Success) return false;
+    if (eig_solver.info() != Eigen::Success) { pipe_last_geom_fail_code = 4; return false; }
 
     auto eigvals = eig_solver.eigenvalues();
     M3D eigvecs = eig_solver.eigenvectors();
@@ -1069,12 +1773,34 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
         u_acc += proj;
     }
     if (u_acc.norm() > 1e-6) u_w = u_acc.normalized();
-    if (u_w.norm() < 1e-6) return false;
+    if (u_w.norm() < 1e-6) { pipe_last_geom_fail_code = 5; return false; }
 
     V3D v_w = axis_w.cross(u_w);
-    if (v_w.norm() < 1e-6) return false;
+    if (v_w.norm() < 1e-6) { pipe_last_geom_fail_code = 6; return false; }
     v_w.normalize();
     u_w = v_w.cross(axis_w).normalized();
+
+    // In a rectangular pipe, W/H can swap when the point distribution changes.
+    // Use gravity to keep the height direction stable when gravity is not
+    // parallel to the pipe axis. The sign is still kept continuous below.
+    if (pipe_size_use_gravity_height)
+    {
+        V3D g_w(s.grav[0], s.grav[1], s.grav[2]);
+        if (g_w.norm() > 1e-6)
+        {
+            V3D height_dir = g_w - axis_w * axis_w.dot(g_w);
+            if (height_dir.norm() > 1e-3)
+            {
+                v_w = height_dir.normalized();
+                u_w = v_w.cross(axis_w);
+                if (u_w.norm() > 1e-6)
+                {
+                    u_w.normalize();
+                    v_w = axis_w.cross(u_w).normalized();
+                }
+            }
+        }
+    }
 
     // Keep cross-section basis orientation continuous across frames.
     if (prev_pipe_basis_valid)
@@ -1130,7 +1856,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
             ssmpl.nu = n.dot(u_w);
             ssmpl.nv = n.dot(v_w);
             double dom = std::max(std::fabs(ssmpl.nu), std::fabs(ssmpl.nv));
-            ssmpl.wall_candidate = (dom >= 0.35);
+            ssmpl.wall_candidate = (dom >= pipe_size_wall_min_normal_cos);
         }
         samples.push_back(ssmpl);
     }
@@ -1138,7 +1864,7 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     double t_min = quantile_from_sorted(t_coords, 0.05);
     double t_max = quantile_from_sorted(t_coords, 0.95);
     double length = t_max - t_min;
-    if (length < 1e-6) return false;
+    if (length < 1e-6) { pipe_last_geom_fail_code = 7; return false; }
 
     double keep_ratio = std::max(0.10, std::min(1.0, pipe_mid_section_keep_ratio));
     double t_center = 0.5 * (t_min + t_max);
@@ -1165,44 +1891,73 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
         }
     }
 
-    if (u_mid_coords.size() < 8 || v_mid_coords.size() < 8) return false;
+    if (u_mid_coords.size() < size_t(std::max(8, pipe_size_min_axis_points / 2)) ||
+        v_mid_coords.size() < size_t(std::max(8, pipe_size_min_axis_points / 2)))
+    {
+        pipe_last_geom_fail_code = 8;
+        return false;
+    }
 
-    double u_min = quantile_from_sorted(u_mid_coords, 0.05);
-    double u_max = quantile_from_sorted(u_mid_coords, 0.95);
-    double v_min = quantile_from_sorted(v_mid_coords, 0.05);
-    double v_max = quantile_from_sorted(v_mid_coords, 0.95);
+    double q_low = std::max(0.0, std::min(0.20, pipe_size_span_q_low));
+    double q_high = std::max(0.80, std::min(1.0, pipe_size_span_q_high));
+    if (q_high <= q_low) { q_low = 0.03; q_high = 0.97; }
+
+    double u_min = quantile_from_sorted(u_mid_coords, q_low);
+    double u_max = quantile_from_sorted(u_mid_coords, q_high);
+    double v_min = quantile_from_sorted(v_mid_coords, q_low);
+    double v_max = quantile_from_sorted(v_mid_coords, q_high);
     double width = u_max - u_min;
     double height = v_max - v_min;
 
-    const size_t min_wall_samples = 6;
-    bool four_wall_fit_ok = (u_pos_wall.size() >= min_wall_samples &&
-                             u_neg_wall.size() >= min_wall_samples &&
-                             v_pos_wall.size() >= min_wall_samples &&
-                             v_neg_wall.size() >= min_wall_samples);
+    const size_t min_wall_samples = size_t(std::max(2, pipe_size_wall_min_side_samples));
+    bool width_wall_ok = (u_pos_wall.size() >= min_wall_samples &&
+                          u_neg_wall.size() >= min_wall_samples);
+    bool height_wall_ok = (v_pos_wall.size() >= min_wall_samples &&
+                           v_neg_wall.size() >= min_wall_samples);
+    bool four_wall_fit_ok = width_wall_ok && height_wall_ok;
 
-    if (four_wall_fit_ok)
+    double wall_width = width;
+    double wall_height = height;
+    double u_center = 0.0;
+    double v_center = 0.0;
+
+    if (width_wall_ok)
     {
-        double u_pos = robust_trimmed_center(u_pos_wall, 0.15, 0.85);
-        double u_neg = robust_trimmed_center(u_neg_wall, 0.15, 0.85);
-        double v_pos = robust_trimmed_center(v_pos_wall, 0.15, 0.85);
-        double v_neg = robust_trimmed_center(v_neg_wall, 0.15, 0.85);
-
+        // Precision mode: estimate opposite-wall distance from the median wall
+        // centers, not from full-span extrema. This suppresses sparse edge
+        // points, grazing reflections, and short-term map thickness.
+        double u_pos = quantile_from_sorted(u_pos_wall, 0.5);
+        double u_neg = quantile_from_sorted(u_neg_wall, 0.5);
         double u_low_raw = std::min(u_pos, u_neg);
         double u_high_raw = std::max(u_pos, u_neg);
-        double v_low_raw = std::min(v_pos, v_neg);
-        double v_high_raw = std::max(v_pos, v_neg);
-
-        // Recentre the local frame on the estimated pipe centerline in the cross section.
-        double u_center = 0.5 * (u_low_raw + u_high_raw);
-        double v_center = 0.5 * (v_low_raw + v_high_raw);
-        axis_point_w = axis_point_w + u_center * u_w + v_center * v_w;
-
+        u_center = 0.5 * (u_low_raw + u_high_raw);
         u_min = u_low_raw - u_center;
         u_max = u_high_raw - u_center;
+        wall_width = u_max - u_min;
+        width = wall_width;
+    }
+
+    if (height_wall_ok)
+    {
+        // Same median-wall policy for height. The median is deliberately used
+        // instead of max/min span so that a few wrong wall labels do not dominate.
+        double v_pos = quantile_from_sorted(v_pos_wall, 0.5);
+        double v_neg = quantile_from_sorted(v_neg_wall, 0.5);
+        double v_low_raw = std::min(v_pos, v_neg);
+        double v_high_raw = std::max(v_pos, v_neg);
+        v_center = 0.5 * (v_low_raw + v_high_raw);
         v_min = v_low_raw - v_center;
         v_max = v_high_raw - v_center;
-        width = std::max(u_max, u_min) - std::min(u_max, u_min);
-        height = std::max(v_max, v_min) - std::min(v_max, v_min);
+        wall_height = v_max - v_min;
+        height = wall_height;
+    }
+
+    // Re-centre any dimension for which both opposite walls are visible. This
+    // is important for a robot sliding on the lower wall: a single frame may
+    // only provide a reliable width or a reliable height, but not always both.
+    if (width_wall_ok || height_wall_ok)
+    {
+        axis_point_w = axis_point_w + u_center * u_w + v_center * v_w;
     }
 
     double u_low = std::min(u_max, u_min);
@@ -1216,12 +1971,68 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     width = std::max(u_max, u_min) - std::min(u_max, u_min);
     height = std::max(v_max, v_min) - std::min(v_max, v_min);
 
-    bool size_ok = (width > pipe_min_width && width < pipe_max_width &&
-                    height > pipe_min_height && height < pipe_max_height);
-    double straight_conf = std::min(1.0, std::max(0.0, (normal_planarity - 0.5) / 0.5));
+    pipe_last_raw_width = width;
+    pipe_last_raw_height = height;
 
-    geom.axis_reliable = (straight_conf > pipe_axis_conf_threshold);
-    geom.box_reliable = geom.axis_reliable && four_wall_fit_ok && size_ok;
+    bool raw_size_ok = (width > pipe_min_width && width < pipe_max_width &&
+                        height > pipe_min_height && height < pipe_max_height);
+    bool width_size_ok = width_wall_ok && (wall_width > pipe_min_width && wall_width < pipe_max_width);
+    bool height_size_ok = height_wall_ok && (wall_height > pipe_min_height && wall_height < pipe_max_height);
+
+    // Keep disabled for precision. Full cross-section span is easily polluted by
+    // outlet face points, robot body edges, and sparse grazing reflections.
+    if (pipe_size_accept_span_fallback &&
+        (!pipe_width_require_both_side_walls || !pipe_height_require_both_top_bottom_walls))
+    {
+        if (!pipe_width_require_both_side_walls && !width_size_ok &&
+            u_mid_coords.size() >= size_t(std::max(8, pipe_size_min_axis_points)) &&
+            width > pipe_min_width && width < pipe_max_width)
+        {
+            wall_width = width;
+            width_size_ok = true;
+        }
+        if (!pipe_height_require_both_top_bottom_walls && !height_size_ok &&
+            v_mid_coords.size() >= size_t(std::max(8, pipe_size_min_axis_points)) &&
+            height > pipe_min_height && height < pipe_max_height)
+        {
+            wall_height = height;
+            height_size_ok = true;
+        }
+    }
+    double straight_conf = std::min(1.0, std::max(0.0, (normal_planarity - 0.5) / 0.5));
+    bool axis_ok = (straight_conf > pipe_axis_conf_threshold);
+    bool raw_box_ok = axis_ok && four_wall_fit_ok && raw_size_ok;
+
+    pipe_last_width_sample_count = int(std::min(u_pos_wall.size(), u_neg_wall.size()));
+    pipe_last_height_sample_count = int(std::min(v_pos_wall.size(), v_neg_wall.size()));
+
+    // Size quantification is decoupled from strict single-frame box reliability.
+    // First obtain the median opposite-wall observation for this frame, then
+    // push it into the sliding history. The public output below is the 10-frame
+    // median-filtered value when the current frame also satisfies the constraints.
+    if (pipe_size_wall_history_enable && pipe_size_accept_partial_pairs)
+        pipe_accept_size_observations(wall_width, width_size_ok, wall_height, height_size_ok, axis_ok);
+    else
+        pipe_accept_size_sample(width, height, raw_box_ok);
+
+    bool current_wall_size_ok = width_size_ok && height_size_ok;
+    bool filtered_size_ok = pipe_stable_width_valid && pipe_stable_height_valid;
+    bool use_filtered_output = pipe_size_stabilize_enable && pipe_size_wall_history_enable;
+
+    pipe_last_constrained_size_valid = current_wall_size_ok &&
+                                       (!use_filtered_output || filtered_size_ok);
+    pipe_last_constrained_width = 0.0;
+    pipe_last_constrained_height = 0.0;
+    if (pipe_last_constrained_size_valid)
+    {
+        pipe_last_constrained_width = use_filtered_output ? pipe_stable_width : wall_width;
+        pipe_last_constrained_height = use_filtered_output ? pipe_stable_height : wall_height;
+    }
+    pipe_last_constrained_width_pair_count = pipe_last_width_sample_count;
+    pipe_last_constrained_height_pair_count = pipe_last_height_sample_count;
+
+    geom.axis_reliable = axis_ok;
+    geom.box_reliable = raw_box_ok;
     geom.valid = geom.box_reliable;
     geom.axis_w = axis_w;
     geom.u_w = u_w;
@@ -1245,6 +2056,11 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     geom.normal_planarity = normal_planarity;
     geom.straight_confidence = straight_conf;
 
+    // Do not overwrite current-frame geometry with stable size here.
+    // Stable W/H are only used by /pipe_size. The per-frame CSV columns must
+    // remain raw observations, otherwise they appear frozen after the first
+    // stable sample and hide whether the detector is actually updating.
+
     if (geom.axis_reliable)
     {
         if (!pipe_global_axis_initialized)
@@ -1266,6 +2082,22 @@ bool fit_rect_pipe_geometry(const state_ikfom &s, RectPipeGeomState &geom)
     {
         geom.global_length = pipe_global_length;
     }
+
+    pipe_last_geom_updated = geom.axis_reliable;
+    pipe_last_geom_fail_code = geom.axis_reliable ? 0 : 9;
+    pipe_last_frame_valid = geom.valid;
+    pipe_last_frame_axis_reliable = geom.axis_reliable;
+    pipe_last_frame_box_reliable = geom.box_reliable;
+    pipe_last_frame_length = geom.length;
+    pipe_last_frame_width = width;
+    pipe_last_frame_height = height;
+    pipe_last_frame_global_length = geom.global_length;
+    pipe_last_frame_conf = geom.straight_confidence;
+    pipe_last_frame_u_pos_count = geom.u_pos_count;
+    pipe_last_frame_u_neg_count = geom.u_neg_count;
+    pipe_last_frame_v_pos_count = geom.v_pos_count;
+    pipe_last_frame_v_neg_count = geom.v_neg_count;
+    pipe_last_frame_four_wall_fit_ok = geom.four_wall_fit_ok;
 
     return geom.axis_reliable;
 }
@@ -1405,7 +2237,7 @@ void augment_with_pipe_priors(const state_ikfom &s,
                               MatrixXd &Hx,
                               VectorXd &h)
 {
-    if (!pipe_prior_enable || !pipe_degenerate || !geom.axis_reliable) return;
+    if (!pipe_prior_enable || !pipe_geometry_prior_enable || !pipe_degenerate || !geom.axis_reliable) return;
 
     vector<RowVectorXd> rows;
     vector<double> residuals;
@@ -1506,13 +2338,36 @@ void publish_path(const ros::Publisher pubPath)
 
 void publish_pipe_size(const ros::Publisher &pubPipeSize)
 {
-    if (!g_pipe_geom.box_reliable) return;
+    // Public output is intentionally reduced to one meaning only:
+    // current-frame W/H after min/max and wall-pair constraints.
+    // Vector3.x is kept as 0.0 because pipe length is no longer part of size output.
+    if (!pipe_last_constrained_size_valid) return;
 
     geometry_msgs::Vector3 msg;
-    msg.x = g_pipe_geom.global_length > 0.0 ? g_pipe_geom.global_length : g_pipe_geom.length;
-    msg.y = g_pipe_geom.width;
-    msg.z = g_pipe_geom.height;
+    msg.x = 0.0;
+    msg.y = pipe_last_constrained_width;
+    msg.z = pipe_last_constrained_height;
     pubPipeSize.publish(msg);
+}
+
+void publish_pipe_pose_suv(const ros::Publisher &pubPipePoseSUV)
+{
+    if (!pipe_last_pipe_s_valid) return;
+
+    geometry_msgs::Vector3 msg;
+    msg.x = pipe_last_pipe_s;  // axial position. In exit-only mode, s = known_length - distance_to_exit.
+    msg.y = 0.0;               // lateral offset along pipe u direction.
+    msg.z = 0.0;               // vertical offset along pipe v direction.
+
+    if (g_pipe_geom.axis_reliable && g_pipe_geom.u_w.norm() > 0.5 && g_pipe_geom.v_w.norm() > 0.5)
+    {
+        V3D lidar_pos_w = state_point.pos + state_point.rot * state_point.offset_T_L_I;
+        V3D rel = lidar_pos_w - g_pipe_geom.axis_point_w;
+        msg.y = rel.dot(g_pipe_geom.u_w.normalized());
+        msg.z = rel.dot(g_pipe_geom.v_w.normalized());
+    }
+
+    pubPipePoseSUV.publish(msg);
 }
 
 void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
@@ -1565,7 +2420,436 @@ void publish_pipe_bbox(const ros::Publisher &pubPipeBBox)
     pubPipeBBox.publish(marker);
 }
 
+void update_pipe_debug_endcap_cloud(const state_ikfom &s, const vector<PipeEndCapState> &caps)
+{
+    pipe_debug_endcap_world->clear();
+    pipe_last_endcap_candidate_count = int(caps.size());
+    if (!pipe_debug_publish_endcap_points) return;
+
+    for (const auto &cap : caps)
+    {
+        if (!cap.visible || cap.points_body.empty()) continue;
+        float inten = 30.0f;
+        if (cap.anchor_id == 1) inten = 100.0f;
+        else if (cap.anchor_id == 2) inten = 200.0f;
+        else if (cap.side < 0) inten = 60.0f;
+        else if (cap.side > 0) inten = 160.0f;
+
+        for (const auto &p_body : cap.points_body)
+        {
+            V3D p_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
+            V3D p_world = s.rot * p_imu + s.pos;
+            PointType pt;
+            pt.x = p_world(0);
+            pt.y = p_world(1);
+            pt.z = p_world(2);
+            pt.intensity = inten;
+            pipe_debug_endcap_world->push_back(pt);
+        }
+    }
+}
+
+void publish_pipe_endcap_points(const ros::Publisher &pubPipeEndcapPoints)
+{
+    if (!pipe_debug_publish_endcap_points) return;
+    sensor_msgs::PointCloud2 msg;
+    pcl::toROSMsg(*pipe_debug_endcap_world, msg);
+    msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+    msg.header.frame_id = "camera_init";
+    pubPipeEndcapPoints.publish(msg);
+}
+
 // ---------------- Pipe entrance / exit end-cap landmark support ----------------
+bool pipe_is_self_mask_point(const V3D &p_body)
+{
+    if (!pipe_self_mask_enable) return false;
+    return (p_body.x() >= pipe_self_mask_x_min && p_body.x() <= pipe_self_mask_x_max &&
+            p_body.y() >= pipe_self_mask_y_min && p_body.y() <= pipe_self_mask_y_max &&
+            p_body.z() >= pipe_self_mask_z_min && p_body.z() <= pipe_self_mask_z_max);
+}
+
+inline V3D pipe_lidar_origin_world(const state_ikfom &s)
+{
+    return s.pos + s.rot * s.offset_T_L_I;
+}
+
+V3D pipe_lidar_axis_world(const state_ikfom &s)
+{
+    V3D axis_lidar(pipe_position_axis_lidar_x,
+                   pipe_position_axis_lidar_y,
+                   pipe_position_axis_lidar_z);
+    if (axis_lidar.norm() < 1e-6) axis_lidar = V3D(1.0, 0.0, 0.0);
+    axis_lidar.normalize();
+
+    V3D forward_w = s.rot * (s.offset_R_L_I * axis_lidar);
+    if (forward_w.norm() < 1e-6) forward_w = V3D(1.0, 0.0, 0.0);
+    forward_w.normalize();
+    return forward_w;
+}
+
+V3D pipe_axis_from_lidar_or_geom(const state_ikfom &s)
+{
+    V3D axis_w = Zero3d;
+    if ((pipe_exit_cap_initialized || pipe_origin_initialized) && pipe_axis_anchor_w.norm() > 1e-6)
+        axis_w = pipe_axis_anchor_w;
+    else if (g_pipe_geom.axis_reliable && g_pipe_geom.axis_w.norm() > 1e-6)
+        axis_w = g_pipe_geom.axis_w;
+    else if (pipe_global_axis_initialized && pipe_global_axis_w.norm() > 1e-6)
+        axis_w = pipe_global_axis_w;
+    else
+    {
+        V3D axis_lidar(pipe_position_axis_lidar_x,
+                       pipe_position_axis_lidar_y,
+                       pipe_position_axis_lidar_z);
+        if (axis_lidar.norm() < 1e-6) axis_lidar = V3D(1.0, 0.0, 0.0);
+        axis_lidar.normalize();
+        axis_w = s.rot * (s.offset_R_L_I * axis_lidar);
+    }
+
+    if (axis_w.norm() < 1e-6) axis_w = pipe_lidar_axis_world(s);
+    axis_w.normalize();
+
+    // Force the positive pipe coordinate to follow the configured LiDAR forward
+    // direction. This prevents s_odom from becoming negative only because an
+    // end-cap normal or PCA axis was selected with the opposite sign.
+    V3D forward_w = pipe_lidar_axis_world(s);
+    if (axis_w.dot(forward_w) < 0.0) axis_w = -axis_w;
+
+    return axis_w;
+}
+
+void pipe_update_lidar_s_odom(const state_ikfom &s)
+{
+    pipe_last_s_odom_valid = false;
+
+    V3D lidar_pos_w = pipe_lidar_origin_world(s);
+    V3D axis_w = pipe_axis_from_lidar_or_geom(s);
+    if (axis_w.norm() < 1e-6) return;
+    axis_w.normalize();
+
+    if (!pipe_axis_odom_initialized)
+    {
+        pipe_lidar_pos0_w = lidar_pos_w;
+        pipe_axis0_w = axis_w;
+        pipe_axis_odom_initialized = true;
+    }
+
+    pipe_last_s_odom = pipe_initial_lidar_s + (lidar_pos_w - pipe_lidar_pos0_w).dot(pipe_axis0_w);
+    pipe_last_s_odom_valid = true;
+}
+
+bool pipe_estimate_d_exit_scan_from_cap(const state_ikfom &s,
+                                         const PipeEndCapState &cap,
+                                         double &d_exit_scan,
+                                         double &plane_res)
+{
+    d_exit_scan = 0.0;
+    plane_res = 0.0;
+
+    if (!pipe_scan_exit_distance_enable) return false;
+    if (!cap.reliable) return false;
+    if (int(cap.points_body.size()) < std::max(6, pipe_endcap_min_points)) return false;
+
+    V3D axis_w = pipe_axis_from_lidar_or_geom(s);
+    if (axis_w.norm() < 1e-6) return false;
+    axis_w.normalize();
+
+    V3D axis_lidar = s.offset_R_L_I.conjugate() * (s.rot.conjugate() * axis_w);
+    if (axis_lidar.norm() < 1e-6) return false;
+    axis_lidar.normalize();
+
+    vector<double> proj;
+    proj.reserve(cap.points_body.size());
+    V3D mean = Zero3d;
+    for (const auto &p : cap.points_body)
+    {
+        proj.push_back(p.dot(axis_lidar));
+        mean += p;
+    }
+    mean /= double(cap.points_body.size());
+
+    double d_med = quantile_from_sorted(proj, 0.5);
+    if (d_med < pipe_exit_min_forward_dist) return false;
+    if (pipe_exit_max_forward_dist > 0.0 && d_med > pipe_exit_max_forward_dist) return false;
+
+    // Keep the plane residual check from the end-cap points, but use the
+    // median axial projection as distance. It is less sensitive to the sign of
+    // the plane normal and to small angular errors in the ray-plane formula.
+    M3D cov = M3D::Zero();
+    for (const auto &p : cap.points_body)
+    {
+        V3D q = p - mean;
+        cov += q * q.transpose();
+    }
+
+    Eigen::SelfAdjointEigenSolver<M3D> es(cov);
+    if (es.info() == Eigen::Success)
+    {
+        V3D n = es.eigenvectors().col(0);
+        if (n.norm() > 1e-6)
+        {
+            n.normalize();
+            double abs_sum = 0.0;
+            for (const auto &p : cap.points_body)
+                abs_sum += std::fabs(n.dot(p - mean));
+            plane_res = abs_sum / double(cap.points_body.size());
+            if (pipe_endcap_max_plane_res > 0.0 && plane_res > pipe_endcap_max_plane_res) return false;
+        }
+    }
+
+    d_exit_scan = d_med;
+    return true;
+}
+
+void pipe_update_scan_exit_distance_output(const state_ikfom &s, const PipeEndCapState &cap)
+{
+    pipe_last_d_exit_scan_valid = false;
+    pipe_last_d_exit_scan = 0.0;
+    pipe_last_scan_plane_res = 0.0;
+
+    double d_scan = 0.0;
+    double res = 0.0;
+    if (!pipe_estimate_d_exit_scan_from_cap(s, cap, d_scan, res)) return;
+
+    pipe_last_d_exit_scan = d_scan;
+    pipe_last_scan_plane_res = res;
+    pipe_last_d_exit_scan_valid = true;
+}
+
+void pipe_update_length_estimate()
+{
+    if (!pipe_length_estimate_enable) return;
+    if (!pipe_last_s_odom_valid || !pipe_last_d_exit_scan_valid) return;
+
+    double L_meas = pipe_last_s_odom + pipe_last_d_exit_scan;
+    pipe_last_length_meas = L_meas;
+
+    if (!(L_meas > 0.05)) return;
+    if (pipe_length_max > 0.0 && L_meas > pipe_length_max) return;
+
+    if (!pipe_length_est_valid)
+    {
+        pipe_length_est = L_meas;
+        pipe_length_est_valid = true;
+        pipe_length_est_samples = 1;
+        return;
+    }
+
+    double err = L_meas - pipe_length_est;
+    if (pipe_length_update_gate > 0.0 && std::fabs(err) > pipe_length_update_gate)
+    {
+        if (pipe_debug_log || pipe_debug_match_stats)
+        {
+            ROS_WARN_STREAM_THROTTLE(0.5, "[PIPE_LEN] reject L_meas=" << L_meas
+                                     << " L_est=" << pipe_length_est
+                                     << " err=" << err
+                                     << " gate=" << pipe_length_update_gate);
+        }
+        return;
+    }
+
+    double alpha = std::max(0.0, std::min(1.0, pipe_length_update_alpha));
+    pipe_length_est = (1.0 - alpha) * pipe_length_est + alpha * L_meas;
+    pipe_length_est_samples++;
+}
+
+void pipe_select_position_output_legacy(const state_ikfom &s)
+{
+    pipe_last_pipe_s_valid = false;
+    if (!pipe_exit_cap_initialized) return;
+
+    V3D axis = pipe_axis_anchor_w;
+    if (axis.norm() < 1e-6) return;
+    axis.normalize();
+
+    V3D lidar_pos_w = pipe_lidar_origin_world(s);
+    pipe_last_distance_to_exit = (pipe_exit_cap_center_w - lidar_pos_w).dot(axis);
+
+    if (pipe_endcap_known_length > 0.0)
+    {
+        pipe_last_pipe_s = pipe_endcap_known_length - pipe_last_distance_to_exit;
+        pipe_last_pipe_s_valid = true;
+    }
+}
+
+void pipe_select_position_output(const state_ikfom &s)
+{
+    pipe_last_pipe_s_valid = false;
+    pipe_last_pipe_length_output = pipe_effective_pipe_length();
+
+    if (pipe_position_output_mode == 0)
+    {
+        pipe_select_position_output_legacy(s);
+        return;
+    }
+
+    if (pipe_position_output_mode == 1 && pipe_endcap_known_length > 0.0 && pipe_last_d_exit_scan_valid)
+    {
+        pipe_last_pipe_s = pipe_endcap_known_length - pipe_last_d_exit_scan;
+        pipe_last_distance_to_exit = pipe_last_d_exit_scan;
+        pipe_last_pipe_s_valid = true;
+        return;
+    }
+
+    // Unknown-length friendly output. s is the LiDAR center axial odometry from
+    // the chosen initial point. The exit distance is a direct scan measurement
+    // when the outlet is visible. Otherwise it is predicted from the online
+    // length estimate, if available.
+    if (pipe_last_s_odom_valid)
+    {
+        pipe_last_pipe_s = pipe_last_s_odom;
+        pipe_last_pipe_s_valid = true;
+
+        if (pipe_last_d_exit_scan_valid)
+            pipe_last_distance_to_exit = pipe_last_d_exit_scan;
+        else if (pipe_endcap_known_length > 0.0)
+            pipe_last_distance_to_exit = pipe_endcap_known_length - pipe_last_s_odom;
+        else if (pipe_length_est_valid)
+            pipe_last_distance_to_exit = pipe_length_est - pipe_last_s_odom;
+        else
+            pipe_last_distance_to_exit = std::numeric_limits<double>::quiet_NaN();
+    }
+}
+
+void pipe_update_exit_pose_outputs(const state_ikfom &s)
+{
+    pipe_update_lidar_s_odom(s);
+    pipe_select_position_output(s);
+}
+
+void pipe_update_position_outputs_with_cap(const state_ikfom &s, const PipeEndCapState &cap)
+{
+    pipe_update_lidar_s_odom(s);
+    pipe_update_scan_exit_distance_output(s, cap);
+    pipe_update_length_estimate();
+    pipe_select_position_output(s);
+}
+
+void pipe_reset_exit_candidate_track()
+{
+    pipe_exit_candidate_frames = 0;
+    pipe_exit_candidate_valid = false;
+    pipe_exit_candidate_center_w = Zero3d;
+    pipe_exit_candidate_normal_w = V3D(1.0, 0.0, 0.0);
+}
+
+void update_exit_only_anchor(const state_ikfom &s, PipeEndCapState &cap, const V3D &axis_w)
+{
+    if (!cap.reliable) return;
+
+    // Do not create a new outlet landmark while the basic FAST-LIO matcher is
+    // already unhealthy. Otherwise a false high-slice plane can be locked, then
+    // its EKF rows can pull the pose away from the map and make nn_ok collapse.
+    if (pipe_endcap_require_lio_healthy && !pipe_exit_cap_initialized &&
+        effct_feat_num < std::max(1, pipe_endcap_min_lio_eff))
+    {
+        cap.anchor_id = 0;
+        cap.matched_anchor = false;
+        cap.s_anchor = pipe_endcap_known_length > 0.0 ? pipe_endcap_known_length : 0.0;
+        cap.s_meas = 0.0;
+        return;
+    }
+
+    // Do not mark a candidate as anchor=2 before it has actually matched the
+    // locked outlet landmark. This avoids logs such as anchor=2 with
+    // endcap_rows=0 and makes append_endcap_rows rejection reasons explicit.
+    cap.anchor_id = 0;
+    cap.matched_anchor = false;
+    cap.s_anchor = pipe_endcap_known_length > 0.0 ? pipe_endcap_known_length : 0.0;
+    cap.s_meas = 0.0;
+
+    V3D n = cap.normal_w.normalized();
+    // Use a positive pipe axis from robot toward the exit.
+    if (n.dot(axis_w) < 0.0) n = -n;
+    cap.normal_w = n;
+
+    bool same_candidate = true;
+    if (!pipe_exit_candidate_valid)
+    {
+        same_candidate = false;
+    }
+    else
+    {
+        double dc = (cap.center_w - pipe_exit_candidate_center_w).norm();
+        double cosn = std::fabs(cap.normal_w.dot(pipe_exit_candidate_normal_w));
+        same_candidate = (dc < pipe_exit_lock_center_gate && cosn > pipe_exit_lock_normal_cos);
+    }
+
+    if (!same_candidate)
+    {
+        pipe_exit_candidate_frames = 1;
+        pipe_exit_candidate_center_w = cap.center_w;
+        pipe_exit_candidate_normal_w = cap.normal_w;
+        pipe_exit_candidate_valid = true;
+    }
+    else
+    {
+        pipe_exit_candidate_frames++;
+        // Light smoothing for the candidate state, not for a locked anchor.
+        pipe_exit_candidate_center_w = 0.8 * pipe_exit_candidate_center_w + 0.2 * cap.center_w;
+        pipe_exit_candidate_normal_w = (0.8 * pipe_exit_candidate_normal_w + 0.2 * cap.normal_w).normalized();
+    }
+
+    if (!pipe_exit_cap_initialized && pipe_exit_candidate_frames >= std::max(1, pipe_exit_lock_min_frames))
+    {
+        pipe_exit_cap_center_w = pipe_exit_candidate_center_w;
+        pipe_axis_anchor_w = pipe_exit_candidate_normal_w.normalized();
+        pipe_exit_cap_d = -pipe_axis_anchor_w.dot(pipe_exit_cap_center_w);
+        pipe_exit_cap_initialized = true;
+        ROS_WARN_STREAM("[EXIT_ONLY] locked exit end-cap. frames=" << pipe_exit_candidate_frames
+                        << " center=(" << pipe_exit_cap_center_w(0) << ", " << pipe_exit_cap_center_w(1) << ", " << pipe_exit_cap_center_w(2) << ")"
+                        << " axis=(" << pipe_axis_anchor_w(0) << ", " << pipe_axis_anchor_w(1) << ", " << pipe_axis_anchor_w(2) << ")");
+    }
+
+    if (pipe_exit_cap_initialized)
+    {
+        // A flat plane is not enough to be the exit landmark. After the exit is
+        // locked, the current candidate must still be close to the fixed exit
+        // plane. This prevents a local wall/body plane with a small fitting
+        // residual from being mislabeled as anchor=2.
+        V3D exit_axis = pipe_axis_anchor_w;
+        if (exit_axis.norm() < 1e-6)
+        {
+            cap.matched_anchor = false;
+            cap.anchor_id = 0;
+            cap.s_meas = 0.0;
+        }
+        else
+        {
+            exit_axis.normalize();
+            double exit_plane_err = std::fabs(exit_axis.dot(cap.center_w) + pipe_exit_cap_d);
+            cap.s_anchor = pipe_endcap_known_length > 0.0 ? pipe_endcap_known_length : 0.0;
+            cap.s_meas = (cap.center_w - pipe_exit_cap_center_w).dot(exit_axis) + cap.s_anchor;
+
+            if (pipe_endcap_anchor_gate > 0.0 && exit_plane_err > pipe_endcap_anchor_gate)
+            {
+                cap.matched_anchor = false;
+                cap.anchor_id = 0;
+                if (pipe_debug_log || pipe_debug_match_stats)
+                {
+                    ROS_WARN_STREAM_THROTTLE(0.5, "[EXIT_ONLY] reject exit candidate by anchor gate. plane_err="
+                                             << exit_plane_err << " gate=" << pipe_endcap_anchor_gate
+                                             << " s_meas=" << cap.s_meas << " s_ref=" << cap.s_anchor
+                                             << " pts=" << cap.point_count << " res=" << cap.mean_abs_res);
+                }
+            }
+            else
+            {
+                cap.matched_anchor = true;
+                cap.anchor_id = 2;
+                pipe_last_endcap_matched = true;
+            }
+        }
+    }
+    else
+    {
+        cap.matched_anchor = false;
+        cap.s_meas = 0.0;
+    }
+
+    pipe_update_exit_pose_outputs(s);
+}
+
 bool fit_endcap_candidate_from_indices(const state_ikfom &s,
                                        const vector<int> &indices,
                                        const vector<V3D> &pts_world,
@@ -1620,7 +2904,19 @@ bool fit_endcap_candidate_from_indices(const state_ikfom &s,
     std::sort(vs.begin(), vs.end());
     double span_u = quantile_from_sorted(us, 0.90) - quantile_from_sorted(us, 0.10);
     double span_v = quantile_from_sorted(vs, 0.90) - quantile_from_sorted(vs, 0.10);
-    if (std::max(span_u, span_v) < pipe_endcap_min_cross_span) return false;
+
+    // A thin axial slice of the side walls can look like a plane whose normal is
+    // parallel to the pipe axis. Requiring only max(span_u, span_v) lets that
+    // false end-cap pass. A real rectangular end face should have visible extent
+    // in both cross-section directions.
+    if (pipe_endcap_require_2d_span)
+    {
+        if (span_u < pipe_endcap_min_cross_span || span_v < pipe_endcap_min_cross_span) return false;
+    }
+    else
+    {
+        if (std::max(span_u, span_v) < pipe_endcap_min_cross_span) return false;
+    }
 
     cap.visible = true;
     cap.reliable = true;
@@ -1738,15 +3034,22 @@ bool detect_pipe_endcap(const state_ikfom &s, const RectPipeGeomState &geom, Pip
     t_vals.reserve(feats_down_size);
 
     V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+    pipe_last_self_mask_reject_count = 0;
     for (int i = 0; i < feats_down_size; ++i)
     {
         const PointType &pb = feats_down_body->points[i];
         V3D p_body(pb.x, pb.y, pb.z);
+        if (pipe_is_self_mask_point(p_body))
+        {
+            pipe_last_self_mask_reject_count++;
+            continue;
+        }
         V3D p_world = pointBodyToWorldVec(p_body, s);
         pts_body.push_back(p_body);
         pts_world.push_back(p_world);
         t_vals.push_back((p_world - lidar_pos_w).dot(axis_w));
     }
+    if (int(pts_world.size()) < pipe_endcap_min_points) return false;
 
     vector<double> t_sorted = t_vals;
     std::sort(t_sorted.begin(), t_sorted.end());
@@ -1781,6 +3084,74 @@ bool detect_pipe_endcap(const state_ikfom &s, const RectPipeGeomState &geom, Pip
 // Detect both entrance/exit end-cap candidates directly from the current frame.
 // This function does not depend on successful map nearest-neighbor matching, so it can run before
 // the "No Effective Points" early return and can provide a fallback landmark update.
+
+bool build_locked_exit_plane_observation(const state_ikfom &s, PipeEndCapState &cap)
+{
+    cap = PipeEndCapState();
+    pipe_last_exit_locked_plane_points = 0;
+
+    if (!pipe_prior_enable || !pipe_endcap_enable) return false;
+    if (!pipe_exit_only_mode || !pipe_exit_locked_plane_prior_enable) return false;
+    if (!pipe_exit_cap_initialized) return false;
+    if (feats_down_size < 1) return false;
+
+    V3D n = pipe_axis_anchor_w;
+    if (n.norm() < 1e-6) return false;
+    n.normalize();
+
+    cap.visible = false;
+    cap.reliable = false;
+    cap.matched_anchor = true;
+    cap.side = +1;
+    cap.anchor_id = 2;
+    cap.normal_w = n;
+    cap.center_w = pipe_exit_cap_center_w;
+    cap.plane_d = pipe_exit_cap_d;
+    cap.axis_cos = 1.0;
+    cap.s_anchor = pipe_endcap_known_length > 0.0 ? pipe_endcap_known_length : 0.0;
+    cap.s_meas = cap.s_anchor;
+
+    int selfrej_local = 0;
+    double abs_sum = 0.0;
+    vector<V3D> accepted_body;
+    accepted_body.reserve(feats_down_size);
+
+    for (int i = 0; i < feats_down_size; ++i)
+    {
+        const PointType &pb = feats_down_body->points[i];
+        V3D p_body(pb.x, pb.y, pb.z);
+        if (pipe_is_self_mask_point(p_body))
+        {
+            selfrej_local++;
+            continue;
+        }
+
+        V3D p_world = pointBodyToWorldVec(p_body, s);
+        double r = n.dot(p_world) + pipe_exit_cap_d;
+        if (std::fabs(r) > pipe_exit_prior_point_gate) continue;
+
+        accepted_body.push_back(p_body);
+        abs_sum += std::fabs(r);
+    }
+
+    // Keep the larger self-mask rejection count for the frame, since the regular
+    // end-cap detector also reports this value.
+    pipe_last_self_mask_reject_count = std::max(pipe_last_self_mask_reject_count, selfrej_local);
+    pipe_last_exit_locked_plane_points = int(accepted_body.size());
+
+    if (int(accepted_body.size()) < std::max(1, pipe_exit_prior_min_points))
+    {
+        return false;
+    }
+
+    cap.points_body.swap(accepted_body);
+    cap.point_count = int(cap.points_body.size());
+    cap.mean_abs_res = cap.point_count > 0 ? abs_sum / cap.point_count : 0.0;
+    cap.visible = true;
+    cap.reliable = true;
+    return true;
+}
+
 bool detect_pipe_endcaps(const state_ikfom &s,
                          const RectPipeGeomState &geom,
                          vector<PipeEndCapState> &caps)
@@ -1792,9 +3163,28 @@ bool detect_pipe_endcaps(const state_ikfom &s,
     if (lidar_forward_w.norm() < 1e-6) lidar_forward_w = V3D(1.0, 0.0, 0.0);
     V3D axis_w = lidar_forward_w.normalized();
 
-    if (pipe_origin_initialized) axis_w = pipe_axis_anchor_w.normalized();
-    else if (geom.axis_reliable) axis_w = geom.axis_w.normalized();
-    else if (pipe_global_axis_initialized) axis_w = pipe_global_axis_w.normalized();
+    // In exit-only mode, do not use an entrance anchor at all. Prefer the current pipe axis
+    // when it is reliable; otherwise use the LiDAR forward direction. Once the exit is locked,
+    // use the locked exit axis only for distance output and prior residuals.
+    if (!pipe_exit_only_mode)
+    {
+        if (pipe_origin_initialized) axis_w = pipe_axis_anchor_w.normalized();
+        else if (geom.axis_reliable) axis_w = geom.axis_w.normalized();
+        else if (pipe_global_axis_initialized) axis_w = pipe_global_axis_w.normalized();
+    }
+    else
+    {
+        // In exit-only mode, once the exit landmark is locked, keep using the
+        // locked exit axis for end-cap slicing. Otherwise the second-stage pipe
+        // geometry axis can jitter or flip, causing the detected end-cap used
+        // for logging to differ from the one used for EKF augmentation.
+        if (pipe_exit_cap_initialized && pipe_axis_anchor_w.norm() > 1e-6)
+            axis_w = pipe_axis_anchor_w.normalized();
+        else if (geom.axis_reliable)
+            axis_w = geom.axis_w.normalized();
+        else if (pipe_global_axis_initialized)
+            axis_w = pipe_global_axis_w.normalized();
+    }
 
     if (axis_w.dot(lidar_forward_w) < 0.0) axis_w = -axis_w;
 
@@ -1819,15 +3209,22 @@ bool detect_pipe_endcaps(const state_ikfom &s,
     t_vals.reserve(feats_down_size);
 
     V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
+    pipe_last_self_mask_reject_count = 0;
     for (int i = 0; i < feats_down_size; ++i)
     {
         const PointType &pb = feats_down_body->points[i];
         V3D p_body(pb.x, pb.y, pb.z);
+        if (pipe_is_self_mask_point(p_body))
+        {
+            pipe_last_self_mask_reject_count++;
+            continue;
+        }
         V3D p_world = pointBodyToWorldVec(p_body, s);
         pts_body.push_back(p_body);
         pts_world.push_back(p_world);
         t_vals.push_back((p_world - lidar_pos_w).dot(axis_w));
     }
+    if (int(pts_world.size()) < pipe_endcap_min_points) return false;
 
     vector<double> t_sorted = t_vals;
     std::sort(t_sorted.begin(), t_sorted.end());
@@ -1850,10 +3247,36 @@ bool detect_pipe_endcaps(const state_ikfom &s,
     bool low_ok = fit_endcap_candidate_from_indices(s, low_idx, pts_world, pts_body, axis_w, u_w, v_w, -1, low_cap);
     bool high_ok = fit_endcap_candidate_from_indices(s, high_idx, pts_world, pts_body, axis_w, u_w, v_w, +1, high_cap);
 
+    if (pipe_exit_only_mode)
+    {
+        // Only the forward/high axial slice is allowed to become the exit landmark.
+        // The lower/back slice is visual clutter for a dual-body robot and is ignored.
+        if (!high_ok)
+        {
+            pipe_update_exit_pose_outputs(s);
+            return false;
+        }
+
+        double forward_dist = (high_cap.center_w - lidar_pos_w).dot(axis_w);
+        if (pipe_exit_only_front_side && forward_dist < pipe_exit_min_forward_dist)
+        {
+            pipe_update_exit_pose_outputs(s);
+            return false;
+        }
+        if (pipe_exit_max_forward_dist > 0.0 && forward_dist > pipe_exit_max_forward_dist)
+        {
+            pipe_update_exit_pose_outputs(s);
+            return false;
+        }
+
+        update_exit_only_anchor(s, high_cap, axis_w);
+        caps.push_back(high_cap);
+        return true;
+    }
+
     if (!low_ok && !high_ok) return false;
 
-    // During initialization, bind the configured entrance side first. This prevents a visible exit
-    // plate from accidentally becoming s=0 when both end-caps are visible.
+    // Legacy two-end mode kept for comparison, but not recommended for the dual-body robot.
     if (!pipe_origin_initialized && pipe_endcap_init_origin)
     {
         PipeEndCapState *entry = nullptr;
@@ -1914,8 +3337,34 @@ bool append_endcap_rows(const state_ikfom &s,
                         vector<RowVectorXd> &rows,
                         vector<double> &residuals)
 {
-    if (!cap.reliable || !cap.matched_anchor || cap.points_body.empty()) return false;
-    if (weight <= 0.0 || cols < 6) return false;
+    if (!cap.reliable || cap.points_body.empty())
+    {
+        pipe_last_endcap_invalid_reject++;
+        pipe_last_endcap_reject_code = 1;
+        return false;
+    }
+    if (!cap.matched_anchor)
+    {
+        pipe_last_endcap_unmatched_reject++;
+        pipe_last_endcap_reject_code = 2;
+        return false;
+    }
+    if (weight <= 0.0 || cols < 6)
+    {
+        pipe_last_endcap_reject_code = 3;
+        return false;
+    }
+    if (pipe_exit_only_mode && cap.anchor_id != 2)
+    {
+        pipe_last_endcap_reject_code = 4;
+        return false;
+    }
+    if (pipe_exit_only_mode && pipe_exit_prior_requires_lock && !pipe_exit_cap_initialized)
+    {
+        pipe_last_endcap_lock_reject++;
+        pipe_last_endcap_reject_code = 5;
+        return false;
+    }
 
     V3D n = pipe_axis_anchor_w.normalized();
     double d = pipe_start_cap_d;
@@ -1932,7 +3381,11 @@ bool append_endcap_rows(const state_ikfom &s,
         V3D p_imu = s.offset_R_L_I * p_body + s.offset_T_L_I;
         V3D p_world = s.rot * p_imu + s.pos;
         double r = n.dot(p_world) + d;
-        if (gate > 0.0 && std::fabs(r) > gate) continue;
+        if (gate > 0.0 && std::fabs(r) > gate)
+        {
+            pipe_last_endcap_gate_reject++;
+            continue;
+        }
 
         M3D point_crossmat;
         point_crossmat << SKEW_SYM_MATRX(p_imu);
@@ -1956,7 +3409,13 @@ bool append_endcap_rows(const state_ikfom &s,
         residuals.push_back(-weight * r);
     }
 
-    return int(rows.size()) > before;
+    if (int(rows.size()) <= before)
+    {
+        pipe_last_endcap_reject_code = 6;
+        return false;
+    }
+    pipe_last_endcap_reject_code = 0;
+    return true;
 }
 
 bool build_endcap_fallback_measurement(const state_ikfom &s,
@@ -1965,6 +3424,7 @@ bool build_endcap_fallback_measurement(const state_ikfom &s,
                                        VectorXd &h)
 {
     if (!pipe_prior_enable || !pipe_endcap_enable || !pipe_endcap_fallback_enable) return false;
+    if (pipe_exit_only_mode && pipe_exit_fallback_requires_lock && !pipe_exit_cap_initialized) return false;
     if (caps.empty()) return false;
 
     vector<RowVectorXd> rows;
@@ -1976,6 +3436,8 @@ bool build_endcap_fallback_measurement(const state_ikfom &s,
     for (const auto &cap : caps)
         append_endcap_rows(s, cap, cols, pipe_endcap_weight, pipe_endcap_fallback_gate, rows, residuals);
 
+    pipe_last_endcap_fallback_rows = int(rows.size());
+    pipe_last_endcap_fallback_used = !rows.empty();
     if (rows.empty()) return false;
 
     Hx = MatrixXd::Zero(int(rows.size()), cols);
@@ -1996,6 +3458,7 @@ void augment_with_endcap_prior(const state_ikfom &s,
 {
     if (!pipe_prior_enable || !pipe_endcap_enable || !pipe_endcap_use_prior) return;
     if (pipe_endcap_weight <= 0.0) return;
+    if (pipe_endcap_require_lio_healthy && effct_feat_num < std::max(1, pipe_endcap_min_lio_eff)) return;
 
     vector<RowVectorXd> rows;
     vector<double> residuals;
@@ -2006,6 +3469,7 @@ void augment_with_endcap_prior(const state_ikfom &s,
 
     int old_rows = Hx.rows();
     int add_rows = rows.size();
+    pipe_last_endcap_prior_rows += add_rows;
     MatrixXd Hx_aug(old_rows + add_rows, Hx.cols());
     VectorXd h_aug(old_rows + add_rows);
     Hx_aug.topRows(old_rows) = Hx;
@@ -2038,6 +3502,17 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     int dbg_pd2_abs_lt_020 = 0;
     double dbg_pd2_abs_sum = 0.0;
     double dbg_pd2_abs_sum_score_ok = 0.0;
+    pipe_last_endcap_candidate_count = 0;
+    pipe_last_endcap_prior_rows = 0;
+    pipe_last_endcap_fallback_rows = 0;
+    pipe_last_endcap_fallback_used = false;
+    pipe_last_endcap_matched = false;
+    pipe_last_endcap_unmatched_reject = 0;
+    pipe_last_endcap_lock_reject = 0;
+    pipe_last_endcap_gate_reject = 0;
+    pipe_last_endcap_invalid_reject = 0;
+    pipe_last_endcap_reject_code = 0;
+    pipe_last_exit_locked_plane_points = 0;
     const float dbg_score_gate = static_cast<float>(std::max(0.0, std::min(1.0, pipe_plane_score_gate)));
     const float dbg_abs_pd2_gate = static_cast<float>(pipe_plane_abs_pd2_gate);
 
@@ -2175,23 +3650,82 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                         << " pd2_lt_0p20=" << dbg_pd2_abs_lt_020);
     }
 
-    // Detect entrance/exit end-cap landmarks before the early return.
-    // This allows the sealed pipe end-caps to act as fallback axial anchors when ordinary
-    // FAST-LIO point-to-map matching temporarily fails.
-    vector<PipeEndCapState> pre_endcaps;
-    detect_pipe_endcaps(s, g_pipe_geom, pre_endcaps);
-    if (!pre_endcaps.empty()) g_endcap = choose_best_endcap_for_log(pre_endcaps);
+    // Update pipe-coordinate outputs before geometry fitting. The stable W/H
+    // filter uses pipe_last_pipe_s in exit-only mode.
+    if (pipe_exit_only_mode)
+    {
+        pipe_update_exit_pose_outputs(s);
+        pipe_anchor_length_for_size();
+    }
+    else if (pipe_origin_initialized)
+    {
+        V3D lidar_pos_w_for_size = s.pos + s.rot * s.offset_T_L_I;
+        pipe_last_pipe_s = (lidar_pos_w_for_size - pipe_origin_w).dot(pipe_axis_anchor_w);
+        pipe_last_pipe_s_valid = true;
+        pipe_anchor_length_for_size();
+    }
+
+    // Fit current pipe geometry before end-cap detection so the end-cap slicer
+    // uses the current frame axis when enough reliable LIO rows exist. The
+    // current-frame measurement log is reset every iteration. If fitting fails,
+    // keep g_pipe_geom only as an internal cached axis for end-cap detection, but
+    // do not log that cached value as a new frame measurement.
+    pipe_reset_frame_geom_observation();
+    RectPipeGeomState geom_for_endcap = g_pipe_geom;
+    if (effct_feat_num >= 20)
+    {
+        RectPipeGeomState current_geom = g_pipe_geom;
+        if (fit_rect_pipe_geometry(s, current_geom))
+        {
+            g_pipe_geom = current_geom;
+            geom_for_endcap = g_pipe_geom;
+        }
+    }
+    else
+    {
+        pipe_last_geom_fail_code = 1;
+    }
+
+    // Detect the current-frame exit end-cap once and reuse this same observation
+    // for logging, RViz debug, fallback, and normal EKF prior augmentation.
+    vector<PipeEndCapState> frame_endcaps;
+    detect_pipe_endcaps(s, geom_for_endcap, frame_endcaps);
+    if (!frame_endcaps.empty())
+        g_endcap = choose_best_endcap_for_log(frame_endcaps);
+    else
+        g_endcap = PipeEndCapState();
+    // Once the outlet landmark is locked, also collect points near the fixed
+    // outlet plane. This cap is appended to the same frame_endcaps vector, so
+    // logging, RViz, fallback, and normal EKF prior all see the same observation.
+    if (pipe_exit_only_mode && pipe_exit_cap_initialized && pipe_exit_locked_plane_prior_enable)
+    {
+        PipeEndCapState locked_exit_cap;
+        if (build_locked_exit_plane_observation(s, locked_exit_cap))
+        {
+            frame_endcaps.push_back(locked_exit_cap);
+            g_endcap = locked_exit_cap;
+        }
+    }
+    pipe_last_endcap_candidate_count = int(frame_endcaps.size());
+    pipe_last_endcap_matched = g_endcap.matched_anchor;
+    pipe_update_position_outputs_with_cap(s, g_endcap);
+    update_pipe_debug_endcap_cloud(s, frame_endcaps);
 
     if (effct_feat_num < 1)
     {
-        if (build_endcap_fallback_measurement(s, pre_endcaps, ekfom_data.h_x, ekfom_data.h))
+        if (build_endcap_fallback_measurement(s, frame_endcaps, ekfom_data.h_x, ekfom_data.h))
         {
             ekfom_data.valid = true;
             res_mean_last = 0.0;
-            if (pipe_origin_initialized)
+            if (pipe_exit_only_mode)
+            {
+                pipe_update_exit_pose_outputs(s);
+            }
+            else if (pipe_origin_initialized)
             {
                 V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
                 pipe_last_pipe_s = (lidar_pos_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+                pipe_last_pipe_s_valid = true;
             }
             if (pipe_debug_log || pipe_debug_match_stats)
             {
@@ -2201,13 +3735,27 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
                                 << " s=" << g_endcap.s_meas
                                 << " s_ref=" << g_endcap.s_anchor
                                 << " res=" << g_endcap.mean_abs_res
-                                << " pipe_s=" << pipe_last_pipe_s);
+                                << " pipe_s=" << pipe_last_pipe_s
+                        << " pipe_s_valid=" << int(pipe_last_pipe_s_valid)
+                        << " dist_exit=" << pipe_last_distance_to_exit);
             }
             return;
         }
 
         ekfom_data.valid = false;
-        ROS_WARN("No Effective Points!");
+        ROS_WARN_STREAM("No Effective Points! endcap_candidates=" << pipe_last_endcap_candidate_count
+                        << " endcap_rows=" << pipe_last_endcap_prior_rows
+                        << " fallback_rows=" << pipe_last_endcap_fallback_rows
+                        << " fallback_used=" << int(pipe_last_endcap_fallback_used)
+                        << " selfrej=" << pipe_last_self_mask_reject_count
+                        << " entry_locked=" << int(pipe_start_cap_initialized)
+                        << " exit_locked=" << int(pipe_exit_cap_initialized)
+                        << " anchor=" << g_endcap.anchor_id
+                        << " pts=" << g_endcap.point_count
+                        << " res=" << g_endcap.mean_abs_res
+                        << " pipe_s=" << pipe_last_pipe_s
+                        << " pipe_s_valid=" << int(pipe_last_pipe_s_valid)
+                        << " dist_exit=" << pipe_last_distance_to_exit);
         return;
     }
 
@@ -2251,54 +3799,54 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     }
 
     // ---- Rectangular pipe degeneracy detection, end-cap landmark detection, and prior augmentation ----
-    fit_rect_pipe_geometry(s, g_pipe_geom);
-    vector<PipeEndCapState> current_endcaps;
-    detect_pipe_endcaps(s, g_pipe_geom, current_endcaps);
-    if (!current_endcaps.empty()) g_endcap = choose_best_endcap_for_log(current_endcaps);
+    if (pipe_exit_only_mode)
+    {
+        pipe_update_exit_pose_outputs(s);
+        pipe_anchor_length_for_size();
+    }
+    else if (pipe_origin_initialized)
+    {
+        V3D lidar_pos_w_for_size = s.pos + s.rot * s.offset_T_L_I;
+        pipe_last_pipe_s = (lidar_pos_w_for_size - pipe_origin_w).dot(pipe_axis_anchor_w);
+        pipe_last_pipe_s_valid = true;
+        pipe_anchor_length_for_size();
+    }
+    // g_pipe_geom was already fitted before end-cap detection in this call.
+    // Do not fit it a second time here, otherwise the observation model can
+    // change inside the same EKF iteration.
     analyze_degeneracy(ekfom_data.h_x, g_pipe_geom);
     augment_with_pipe_priors(s, g_pipe_geom, ekfom_data.h_x, ekfom_data.h);
-    for (const auto &cap : current_endcaps)
+    for (const auto &cap : frame_endcaps)
         augment_with_endcap_prior(s, cap, ekfom_data.h_x, ekfom_data.h);
 
-    if (pipe_origin_initialized)
+    if (pipe_exit_only_mode)
+    {
+        pipe_update_exit_pose_outputs(s);
+    }
+    else if (pipe_origin_initialized)
     {
         V3D lidar_pos_w = s.pos + s.rot * s.offset_T_L_I;
         pipe_last_pipe_s = (lidar_pos_w - pipe_origin_w).dot(pipe_axis_anchor_w);
+        pipe_last_pipe_s_valid = true;
     }
 
     if (pipe_debug_log)
     {
         ROS_INFO_THROTTLE(0.5,
-                          "pipe valid=%d axis=%d box=%d deg=%d eig_min=%.3e cond=%.3e axial=%.3e lateral=%.3e ratio=%.3f min_pos_rel=%.3f u=%.3e v=%.3e deg_src(abs=%d rel=%d axis=%d cond=%d) local_size=(L=%.3f, W=%.3f, H=%.3f) global_L=%.3f conf=%.3f endcap(vis=%d rel=%d anchor=%d pts=%d s=%.3f s_ref=%.3f res=%.3f) pipe_s=%.3f",
-                          g_pipe_geom.valid,
-                          g_pipe_geom.axis_reliable,
-                          g_pipe_geom.box_reliable,
-                          pipe_degenerate,
-                          pipe_last_min_eig,
-                          pipe_last_cond_num,
-                          pipe_last_axial_info,
-                          pipe_last_lateral_info,
-                          pipe_last_axial_ratio,
-                          pipe_last_min_pos_rel,
-                          pipe_last_u_info,
-                          pipe_last_v_info,
-                          pipe_last_deg_by_abs_eig,
-                          pipe_last_deg_by_rel_eig,
-                          pipe_last_deg_by_axial_ratio,
-                          pipe_last_deg_by_cond,
-                          g_pipe_geom.length,
-                          g_pipe_geom.width,
-                          g_pipe_geom.height,
-                          g_pipe_geom.global_length,
-                          g_pipe_geom.straight_confidence,
-                          g_endcap.visible,
-                          g_endcap.reliable,
-                          g_endcap.anchor_id,
-                          g_endcap.point_count,
-                          g_endcap.s_meas,
-                          g_endcap.s_anchor,
-                          g_endcap.mean_abs_res,
-                          pipe_last_pipe_s);
+                          "pipe_size current_valid=%d width=%.3f height=%.3f width_pairs=%d height_pairs=%d axis=%d geom_up=%d fail=%d pose_s=%.3f s_odom=%.3f d_scan=%.3f L_est=%.3f robot_pose=%d",
+                          int(pipe_last_constrained_size_valid),
+                          pipe_last_constrained_width,
+                          pipe_last_constrained_height,
+                          pipe_last_constrained_width_pair_count,
+                          pipe_last_constrained_height_pair_count,
+                          int(pipe_last_frame_axis_reliable),
+                          int(pipe_last_geom_updated),
+                          pipe_last_geom_fail_code,
+                          pipe_last_pipe_s,
+                          pipe_last_s_odom,
+                          pipe_last_d_exit_scan,
+                          pipe_length_est,
+                          int(robot_pose_origin_enable && robot_origin_inited));
     }
 
 
@@ -2345,12 +3893,18 @@ int main(int argc, char** argv)
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
     nh.param<bool>("pipe_prior/enable", pipe_prior_enable, true);
     nh.param<bool>("pipe_prior/debug_log", pipe_debug_log, false);
+    nh.param<bool>("pipe_prior/geometry_prior_enable", pipe_geometry_prior_enable, false);
+    nh.param<bool>("pipe_prior/endcap_require_lio_healthy", pipe_endcap_require_lio_healthy, true);
+    nh.param<int>("pipe_prior/endcap_min_lio_eff", pipe_endcap_min_lio_eff, 30);
+    nh.param<bool>("pipe_prior/endcap_require_2d_span", pipe_endcap_require_2d_span, true);
+    nh.param<double>("pipe_prior/exit_max_forward_dist", pipe_exit_max_forward_dist, 1.50);
+    nh.param<int>("pipe_prior/map_filter_min_eff", pipe_map_filter_min_eff, 20);
     nh.param<double>("pipe_prior/weight_box", pipe_prior_weight, 8.0);
     nh.param<double>("pipe_prior/weight_axis_align", pipe_axis_align_weight, 3.0);
     nh.param<double>("pipe_prior/weight_motion", pipe_motion_weight, 1.5);
-    nh.param<double>("pipe_prior/min_width", pipe_min_width, 0.25);
+    nh.param<double>("pipe_prior/min_width", pipe_min_width, 0.06);
     nh.param<double>("pipe_prior/max_width", pipe_max_width, 1.00);
-    nh.param<double>("pipe_prior/min_height", pipe_min_height, 0.25);
+    nh.param<double>("pipe_prior/min_height", pipe_min_height, 0.06);
     nh.param<double>("pipe_prior/max_height", pipe_max_height, 1.00);
     nh.param<double>("pipe_prior/axis_conf_threshold", pipe_axis_conf_threshold, 0.35);
     nh.param<double>("pipe_prior/degenerate_min_eig", pipe_degenerate_min_eig, 1e-4);
@@ -2386,10 +3940,81 @@ int main(int argc, char** argv)
     nh.param<double>("pipe_prior/endcap_anchor_gate", pipe_endcap_anchor_gate, 0.35);
     nh.param<double>("pipe_prior/endcap_exit_learn_min_s", pipe_endcap_exit_learn_min_s, 0.80);
     nh.param<double>("pipe_prior/endcap_known_length", pipe_endcap_known_length, -1.0);
+    nh.param<int>("pipe_prior/position_output_mode", pipe_position_output_mode, 2);
+    nh.param<double>("pipe_prior/initial_lidar_s", pipe_initial_lidar_s, 0.0);
+    nh.param<bool>("pipe_prior/scan_exit_distance_enable", pipe_scan_exit_distance_enable, true);
+    nh.param<double>("pipe_prior/position_axis_lidar_x", pipe_position_axis_lidar_x, 1.0);
+    nh.param<double>("pipe_prior/position_axis_lidar_y", pipe_position_axis_lidar_y, 0.0);
+    nh.param<double>("pipe_prior/position_axis_lidar_z", pipe_position_axis_lidar_z, 0.0);
+    nh.param<bool>("pipe_prior/length_estimate_enable", pipe_length_estimate_enable, true);
+    nh.param<double>("pipe_prior/length_update_alpha", pipe_length_update_alpha, 0.05);
+    nh.param<double>("pipe_prior/length_update_gate", pipe_length_update_gate, 0.20);
+    nh.param<double>("pipe_prior/length_max", pipe_length_max, 20.0);
     nh.param<bool>("pipe_prior/endcap_fallback_enable", pipe_endcap_fallback_enable, true);
     nh.param<double>("pipe_prior/endcap_fallback_gate", pipe_endcap_fallback_gate, 0.60);
     nh.param<int>("pipe_prior/endcap_entry_side", pipe_endcap_entry_side, -1);
+    nh.param<bool>("pipe_prior/exit_only_mode", pipe_exit_only_mode, true);
+    nh.param<bool>("pipe_prior/exit_only_front_side", pipe_exit_only_front_side, true);
+    nh.param<double>("pipe_prior/exit_min_forward_dist", pipe_exit_min_forward_dist, 0.20);
+    nh.param<int>("pipe_prior/exit_lock_min_frames", pipe_exit_lock_min_frames, 5);
+    nh.param<double>("pipe_prior/exit_lock_center_gate", pipe_exit_lock_center_gate, 0.10);
+    nh.param<double>("pipe_prior/exit_lock_normal_cos", pipe_exit_lock_normal_cos, 0.95);
+    nh.param<bool>("pipe_prior/exit_prior_requires_lock", pipe_exit_prior_requires_lock, true);
+    nh.param<bool>("pipe_prior/exit_fallback_requires_lock", pipe_exit_fallback_requires_lock, true);
+    nh.param<bool>("pipe_prior/exit_locked_plane_prior_enable", pipe_exit_locked_plane_prior_enable, true);
+    nh.param<double>("pipe_prior/exit_prior_point_gate", pipe_exit_prior_point_gate, 0.05);
+    nh.param<int>("pipe_prior/exit_prior_min_points", pipe_exit_prior_min_points, 6);
+    nh.param<bool>("pipe_prior/debug_publish_endcap_points", pipe_debug_publish_endcap_points, true);
+    nh.param<bool>("pipe_prior/self_mask_enable", pipe_self_mask_enable, false);
+    nh.param<double>("pipe_prior/self_mask_x_min", pipe_self_mask_x_min, -0.70);
+    nh.param<double>("pipe_prior/self_mask_x_max", pipe_self_mask_x_max, -0.05);
+    nh.param<double>("pipe_prior/self_mask_y_min", pipe_self_mask_y_min, -0.18);
+    nh.param<double>("pipe_prior/self_mask_y_max", pipe_self_mask_y_max,  0.18);
+    nh.param<double>("pipe_prior/self_mask_z_min", pipe_self_mask_z_min, -0.15);
+    nh.param<double>("pipe_prior/self_mask_z_max", pipe_self_mask_z_max,  0.15);
+    nh.param<bool>("pipe_prior/size_stabilize_enable", pipe_size_stabilize_enable, true);
+    nh.param<bool>("pipe_prior/size_exclude_endcap_points", pipe_size_exclude_endcap_points, false);
+    nh.param<double>("pipe_prior/size_endcap_exclusion", pipe_size_endcap_exclusion, 0.15);
+    nh.param<double>("pipe_prior/size_update_s_min_ratio", pipe_size_update_s_min_ratio, 0.20);
+    nh.param<double>("pipe_prior/size_update_s_max_ratio", pipe_size_update_s_max_ratio, 0.70);
+    nh.param<int>("pipe_prior/size_window", pipe_size_window, 10);
+    nh.param<int>("pipe_prior/size_min_stable_samples", pipe_size_min_stable_samples, 5);
+    nh.param<double>("pipe_prior/size_jump_gate", pipe_size_jump_gate, 0.08);
+    nh.param<string>("pipe_prior/size_average_mode", pipe_size_average_mode, string("median"));
+    nh.param<double>("pipe_prior/size_trim_ratio", pipe_size_trim_ratio, 0.10);
+    nh.param<bool>("pipe_prior/size_require_anchor", pipe_size_require_anchor, true);
+    nh.param<bool>("pipe_prior/size_use_gravity_height", pipe_size_use_gravity_height, true);
+    nh.param<bool>("pipe_prior/size_wall_history_enable", pipe_size_wall_history_enable, true);
+    nh.param<int>("pipe_prior/size_wall_min_side_samples", pipe_size_wall_min_side_samples, 5);
+    nh.param<int>("pipe_prior/size_min_axis_points", pipe_size_min_axis_points, 20);
+    nh.param<double>("pipe_prior/size_wall_center_q_low", pipe_size_wall_center_q_low, 0.15);
+    nh.param<double>("pipe_prior/size_wall_center_q_high", pipe_size_wall_center_q_high, 0.85);
+    nh.param<double>("pipe_prior/size_span_q_low", pipe_size_span_q_low, 0.03);
+    nh.param<double>("pipe_prior/size_span_q_high", pipe_size_span_q_high, 0.97);
+    nh.param<double>("pipe_prior/size_wall_min_normal_cos", pipe_size_wall_min_normal_cos, 0.35);
+    nh.param<bool>("pipe_prior/size_accept_partial_pairs", pipe_size_accept_partial_pairs, true);
+    nh.param<bool>("pipe_prior/size_update_requires_axis", pipe_size_update_requires_axis, false);
+    nh.param<bool>("pipe_prior/size_update_zone_enable", pipe_size_update_zone_enable, false);
+    nh.param<bool>("pipe_prior/size_accept_span_fallback", pipe_size_accept_span_fallback, false);
+    nh.param<bool>("pipe_prior/size_publish_stable", pipe_size_publish_stable, false);
+    nh.param<bool>("pipe_prior/size_publish_fallback_to_stable", pipe_size_publish_fallback_to_stable, false);
+    nh.param<bool>("pipe_prior/robot_pose_origin_enable", robot_pose_origin_enable, true);
+    nh.param<bool>("pipe_prior/robot_pose_origin_publish_tf", robot_pose_origin_publish_tf, true);
+    nh.param<bool>("pipe_prior/robot_pose_origin_path_enable", robot_pose_origin_path_enable, true);
+    nh.param<int>("pipe_prior/robot_pose_origin_path_stride", robot_pose_origin_path_stride, 10);
+    nh.param<string>("pipe_prior/robot_pose_origin_frame", robot_pose_origin_frame, string("robot_origin"));
+    nh.param<string>("pipe_prior/robot_pose_origin_child_frame", robot_pose_origin_child_frame, string("body_in_robot_origin"));
+    nh.param<bool>("pipe_prior/width_require_both_side_walls", pipe_width_require_both_side_walls, true);
+    nh.param<bool>("pipe_prior/height_require_both_top_bottom_walls", pipe_height_require_both_top_bottom_walls, true);
+    nh.param<bool>("pipe_prior/width_hold_last_valid", pipe_width_hold_last_valid, true);
+    nh.param<bool>("pipe_prior/height_hold_last_valid", pipe_height_hold_last_valid, true);
 
+    ROS_WARN_STREAM("[PIPE PARAM] geometry_prior_enable=" << pipe_geometry_prior_enable);
+    ROS_WARN_STREAM("[PIPE PARAM] endcap_require_lio_healthy=" << pipe_endcap_require_lio_healthy
+                    << " min_lio_eff=" << pipe_endcap_min_lio_eff
+                    << " require_2d_span=" << pipe_endcap_require_2d_span
+                    << " exit_max_forward_dist=" << pipe_exit_max_forward_dist
+                    << " map_filter_min_eff=" << pipe_map_filter_min_eff);
     ROS_WARN_STREAM("[PIPE PARAM] apply_incidence_filter_in_lio=" << pipe_apply_incidence_filter_in_lio);
     ROS_WARN_STREAM("[PIPE PARAM] min_incidence_cos=" << pipe_min_incidence_cos);
     ROS_WARN_STREAM("[PIPE PARAM] axis_conf_threshold=" << pipe_axis_conf_threshold);
@@ -2411,6 +4036,37 @@ int main(int argc, char** argv)
                     << " fallback_gate=" << pipe_endcap_fallback_gate
                     << " entry_side=" << pipe_endcap_entry_side
                     << " known_length=" << pipe_endcap_known_length);
+    ROS_WARN_STREAM("[PIPE PARAM] exit_only_mode=" << pipe_exit_only_mode
+                    << " front_only=" << pipe_exit_only_front_side
+                    << " min_forward=" << pipe_exit_min_forward_dist
+                    << " lock_frames=" << pipe_exit_lock_min_frames
+                    << " known_length=" << pipe_endcap_known_length);
+    ROS_WARN_STREAM("[PIPE PARAM] debug_publish_endcap_points=" << pipe_debug_publish_endcap_points);
+    ROS_WARN_STREAM("[PIPE PARAM] self_mask_enable=" << pipe_self_mask_enable
+                    << " x=[" << pipe_self_mask_x_min << "," << pipe_self_mask_x_max << "]"
+                    << " y=[" << pipe_self_mask_y_min << "," << pipe_self_mask_y_max << "]"
+                    << " z=[" << pipe_self_mask_z_min << "," << pipe_self_mask_z_max << "]");
+    ROS_WARN_STREAM("[PIPE PARAM] size_stabilize=" << pipe_size_stabilize_enable
+                    << " exclude_endcap=" << pipe_size_exclude_endcap_points
+                    << " exclusion=" << pipe_size_endcap_exclusion
+                    << " update_ratio=[" << pipe_size_update_s_min_ratio << "," << pipe_size_update_s_max_ratio << "]"
+                    << " window=" << pipe_size_window
+                    << " min_samples=" << pipe_size_min_stable_samples
+                    << " jump_gate=" << pipe_size_jump_gate
+                    << " avg_mode=" << pipe_size_average_mode
+                    << " trim=" << pipe_size_trim_ratio
+                    << " require_anchor=" << pipe_size_require_anchor
+                    << " gravity_height=" << pipe_size_use_gravity_height
+                    << " update_requires_axis=" << pipe_size_update_requires_axis
+                    << " update_zone_enable=" << pipe_size_update_zone_enable
+                    << " partial_pairs=" << pipe_size_accept_partial_pairs
+                    << " span_fallback=" << pipe_size_accept_span_fallback);
+    ROS_WARN_STREAM("[ROBOT POSE] origin_enable=" << robot_pose_origin_enable
+                    << " frame=" << robot_pose_origin_frame
+                    << " child=" << robot_pose_origin_child_frame
+                    << " publish_tf=" << robot_pose_origin_publish_tf
+                    << " path_enable=" << robot_pose_origin_path_enable
+                    << " path_stride=" << robot_pose_origin_path_stride);
 
     p_pre->lidar_type = lidar_type;
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
@@ -2461,8 +4117,21 @@ int main(int argc, char** argv)
     else
         cout << "~~~~"<<ROOT_DIR<<" doesn't exist" << endl;
 
+    ensure_log_directory_exists(root_dir);
+
     string pipe_csv_path = root_dir + "/Log/pipe_metrics.csv";
     init_pipe_csv_log(pipe_csv_path);
+
+    string robot_pose_csv_path = root_dir + "/Log/robot_pose_origin.csv";
+    robot_pose_csv_log.open(robot_pose_csv_path.c_str(), ios::out | ios::trunc);
+    if (robot_pose_csv_log.is_open())
+    {
+        robot_pose_csv_log << "stamp_abs,stamp_rel,x,y,z,qx,qy,qz,qw,roll,pitch,yaw,vx,vy,vz\n";
+    }
+    else
+    {
+        ROS_WARN_STREAM("[ROBOT POSE] failed to open csv log: " << robot_pose_csv_path);
+    }
 
     /*** ROS subscribe initialization ***/
     ros::Subscriber sub_pcl = p_pre->lidar_type == AVIA ? \
@@ -2479,12 +4148,20 @@ int main(int argc, char** argv)
             ("/Laser_map", 100000);
     ros::Publisher pubOdomAftMapped = nh.advertise<nav_msgs::Odometry> 
             ("/Odometry", 100000);
+    ros::Publisher pubRobotOdomOrigin = nh.advertise<nav_msgs::Odometry>
+            ("/robot_pose_origin", 100000);
+    ros::Publisher pubRobotPathOrigin = nh.advertise<nav_msgs::Path>
+            ("/robot_path_origin", 100000);
     ros::Publisher pubPath          = nh.advertise<nav_msgs::Path> 
             ("/path", 100000);
     ros::Publisher pubPipeSize      = nh.advertise<geometry_msgs::Vector3>
             ("/pipe_size", 1000);
     ros::Publisher pubPipeBBox      = nh.advertise<visualization_msgs::Marker>
             ("/pipe_bbox", 10);
+    ros::Publisher pubPipePoseSUV   = nh.advertise<geometry_msgs::Vector3>
+            ("/pipe_pose_suv", 1000);
+    ros::Publisher pubPipeEndcapPoints = nh.advertise<sensor_msgs::PointCloud2>
+            ("/pipe_endcap_points", 10);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -2597,6 +4274,7 @@ int main(int argc, char** argv)
 
             /******* Publish odometry *******/
             publish_odometry(pubOdomAftMapped);
+            publish_robot_pose_origin(pubRobotOdomOrigin, pubRobotPathOrigin);
             prev_lidar_pos_world = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             prev_lidar_pos_valid = true;
 
@@ -2608,7 +4286,9 @@ int main(int argc, char** argv)
             /******* Publish points *******/
             if (path_en)                         publish_path(pubPath);
             publish_pipe_size(pubPipeSize);
+            publish_pipe_pose_suv(pubPipePoseSUV);
             publish_pipe_bbox(pubPipeBBox);
+            publish_pipe_endcap_points(pubPipeEndcapPoints);
             append_pipe_csv_log(Measures.lidar_beg_time, Measures.lidar_beg_time - first_lidar_time);
             if (scan_pub_en || pcd_save_en)      publish_frame_world(pubLaserCloudFull);
             if (scan_pub_en && scan_body_pub_en) publish_frame_body(pubLaserCloudFull_body);
